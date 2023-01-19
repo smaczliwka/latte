@@ -2,9 +2,10 @@ module Emiter where
 
 import AbsLatte
 import Data.Map
+import Data.Set (Set, fromList, member)
 
 data RegType = RegInt | RegStr | RegBool | RegVoid
-    deriving (Eq)
+    deriving (Eq, Ord)
 
 type RegNum = Integer
 type Reg = (RegType, RegNum)
@@ -17,7 +18,7 @@ typeRegType t = case t of
     Void _ -> RegVoid
 
 data Const = ConstInt Integer | ConstBool Bool | ConstVoid
-    deriving (Eq)
+    deriving (Eq, Ord)
 
 typeDefault :: Type -> Res
 typeDefault t = case t of
@@ -62,6 +63,7 @@ data Op
     | BitcastOp Reg Integer StrNum
     | EndFunOp
     | CallVoidOp Ident [Res]
+    deriving (Eq, Ord)
 
 opCode :: Op -> [Op] -> [Op]
 opCode op rest = op : rest
@@ -403,7 +405,7 @@ emitDF (FnDef pos t id args block) gF nextLab gS =
         let (gV', gB', nextReg', nextLab', code', gS') = emitB block Data.Map.empty gF gB nextReg (nextLab + 1) gS in
             case t of
                 Str _ -> let dest = (RegStr, nextReg') in
-                    if member "" gS' then
+                    if Data.Map.member "" gS' then
                         (nextLab',
                         opCode (FunOp id (typeRegType t) argList)
                         . opCode (LabelOp nextLab)
@@ -445,11 +447,156 @@ removeRets ops acc = case (ops, acc) of
     (RetOp _ : restOps, RetOp _ : restAcc) -> removeRets restOps acc
     (op : restOps, _) -> removeRets restOps (op : acc)
 
+reacheable :: [Op] -> [Label] -> Set Label
+reacheable ops acc =
+    case ops of
+        [] -> Data.Set.fromList acc
+        (GoOp label : rest) -> reacheable rest (label : acc)
+        (CondGoOp _ label1 label2 : rest) -> reacheable rest (label1 : label2 : acc)
+        (_ : rest) -> reacheable rest acc
+
+removeUnreachable :: [Op] -> Bool -> Set Label -> [Op] -> [Op]
+removeUnreachable ops last reach acc =
+    case (ops, last) of
+        ([], _) -> reverse acc
+        (FunOp id regType regs : LabelOp label : rest, _) ->
+            removeUnreachable rest True reach (LabelOp label : FunOp id regType regs : acc)
+        (EndFunOp : rest, _) -> removeUnreachable rest last reach (EndFunOp : acc)
+        (LabelOp label : rest, _) ->
+            if Data.Set.member label reach then removeUnreachable rest True reach (LabelOp label : acc)
+            else removeUnreachable rest False reach acc
+        (op : rest, True) -> removeUnreachable rest last reach (op : acc)
+        (op : rest, False) -> removeUnreachable rest last reach acc
+
+replacement :: Map Reg Reg -> Res -> Res
+replacement repl res =
+    case res of
+        Left const -> Left const
+        Right reg ->
+            if Data.Map.member reg repl then Right (repl ! reg)
+            else Right reg
+
+replacementPhi :: Map Reg Reg -> (Res, Label) -> (Res, Label)
+replacementPhi repl (res, label) = (replacement repl res, label)
+
+replace :: Map Reg Reg -> Op -> Op
+replace repl op =
+    case op of
+        PlusOp reg res1 res2 -> PlusOp reg (replacement repl res1) (replacement repl res2)
+        MinusOp reg res1 res2 -> MinusOp reg (replacement repl res1) (replacement repl res2)
+        TimesOp reg res1 res2 -> TimesOp reg (replacement repl res1) (replacement repl res2)
+        DivOp reg res1 res2 -> DivOp reg (replacement repl res1) (replacement repl res2)
+        ModOp reg res1 res2 -> ModOp reg (replacement repl res1) (replacement repl res2)
+        LTHOp reg res1 res2 -> LTHOp reg (replacement repl res1) (replacement repl res2)
+        LEOp reg res1 res2 -> LEOp reg (replacement repl res1) (replacement repl res2)
+        GTHOp reg res1 res2 -> GTHOp reg (replacement repl res1) (replacement repl res2)
+        GEOp reg res1 res2 -> GEOp reg (replacement repl res1) (replacement repl res2)
+        EQUOp reg res1 res2 -> EQUOp reg (replacement repl res1) (replacement repl res2)
+        NEOp reg res1 res2 -> NEOp reg (replacement repl res1) (replacement repl res2)
+        -- AndOp i
+        -- OrOp nieużywane
+        NotOp reg res -> NotOp reg (replacement repl res)
+        NegOp reg res -> NegOp reg (replacement repl res)
+        -- GoOp nie korzysta z rejestrów
+        CondGoOp res label1 label2 -> CondGoOp (replacement repl res) label1 label2
+        CallOp reg id results -> CallOp reg id (Prelude.map (replacement repl) results)
+        RetOp res -> RetOp (replacement repl res)
+        -- LabelOp nie korzysta z rejestrów
+        PhiOp reg pairs -> PhiOp reg (Prelude.map (replacementPhi repl) pairs) -- trzeba jeszcze usuwać powtórzenia
+        -- FunOp nie korzysta z rejestrów
+        -- BitcastOp nie korzysta z rejestrów
+        -- EndFunOp nie korzysta z rejestrów
+        CallVoidOp id results -> CallVoidOp id (Prelude.map (replacement repl) results)
+        op -> op -- cała reszta
+
+fakeReg :: Reg
+fakeReg = (RegVoid, -1)
+
+fakeDest :: Op -> Maybe (Op, Reg)
+fakeDest op =
+    case op of
+        PlusOp reg res1 res2 -> Just (PlusOp fakeReg res1 res2, reg)
+        MinusOp reg res1 res2 -> Just (MinusOp fakeReg res1 res2, reg)
+        TimesOp reg res1 res2 -> Just (TimesOp fakeReg res1 res2, reg)
+        DivOp reg res1 res2 -> Just (DivOp fakeReg res1 res2, reg)
+        ModOp reg res1 res2 -> Just (ModOp fakeReg res1 res2, reg)
+        LTHOp reg res1 res2 -> Just (LTHOp fakeReg res1 res2, reg)
+        LEOp reg res1 res2 -> Just (LEOp fakeReg res1 res2, reg)
+        GTHOp reg res1 res2 -> Just (GTHOp fakeReg res1 res2, reg)
+        GEOp reg res1 res2 -> Just (GEOp fakeReg res1 res2, reg)
+        EQUOp reg res1 res2 -> Just (EQUOp fakeReg res1 res2, reg)
+        NEOp reg res1 res2 -> Just (NEOp fakeReg res1 res2, reg)
+        -- AndOp i
+        -- OrOp nieużywane
+        NotOp reg res -> Just (NotOp fakeReg res, reg)
+        NegOp reg res -> Just (NegOp fakeReg res, reg)
+        -- GoOp nie umieszcza wyniku w rejestrze
+        -- CondGoOp nie umieszcza wyniku w rejestrze
+        -- CallOp reg id results -> Just (CallOp fakeReg id results, reg) <----------- nie chcemy spamiętywać wyników calli
+        -- RetOp nie umieszcza wyniku w rejestrze
+        -- LabelOp nie umieszcza wyniku w rejestrze
+        PhiOp reg pairs -> Just (PhiOp fakeReg pairs, reg)
+        -- FunOp nie umieszcza wyniku w rejestrze
+        BitcastOp reg len idx -> Just (BitcastOp fakeReg len idx, reg)
+        -- EndFunOp nie umieszcza wyniku w rejestrze
+        -- CallVoidOp nie umieszcza wyniku w rejestrze
+        op -> Nothing -- cała reszta nie umieszcza wyniku w rejestrze
+
+lcse :: Map Op Reg -> Map Reg Reg -> [Op] -> [Op] -> [Op]
+lcse comp repl acc ops =
+    case ops of
+
+        [FunOp id regType regs] -> [FunOp id regType regs]
+        [EndFunOp] -> [EndFunOp]
+
+        [] -> reverse acc
+        (op : rest) ->
+            let opRepl = replace repl op in
+                case fakeDest opRepl of
+                    Nothing -> lcse comp repl (opRepl : acc) rest -- operacja nie umieszcza wyniku w rejestrze
+                    Just (opRepl', dest) ->
+                        case Data.Map.lookup opRepl' comp of
+                            Just dest' -> lcse comp (insert dest dest' repl) acc rest -- wyrażenie policzone wcześniej i wynik w dest'
+                            Nothing -> lcse (insert opRepl' dest comp) repl (opRepl : acc) rest -- wyrażenie nie policzone wcześniej
+
+optimize :: [Op] -> [Op]
+optimize ops =
+    let reach = reacheable ops [] in
+        removeUnreachable ops True reach []
+
+splitIntoFunctions :: [Op] -> [[Op]] -> [Op] -> [[Op]]
+splitIntoFunctions fun acc ops =
+    case ops of
+        [] -> reverse acc
+        (EndFunOp : rest) -> splitIntoFunctions [] ((reverse (EndFunOp : fun)) : acc) rest
+        (op : rest) -> splitIntoFunctions (op : fun) acc rest
+
+splitIntoBlocks :: [Op] -> [[Op]] -> [Op] -> [[Op]]
+splitIntoBlocks block acc ops =
+    case ops of
+        [] -> reverse acc
+        (GoOp label : rest) -> splitIntoBlocks [] ((reverse (GoOp label : block)) : acc) rest
+        (CondGoOp res label1 label2 : rest) -> splitIntoBlocks [] ((reverse (CondGoOp res label1 label2 : block)) : acc)  rest
+        (RetOp res : rest) -> splitIntoBlocks [] ((reverse (RetOp res : block)) : acc) rest
+
+        (FunOp id regType regs : rest) -> splitIntoBlocks [] ([FunOp id regType regs] : acc) rest
+        (EndFunOp : rest) -> splitIntoBlocks [] ([EndFunOp] : acc) rest
+
+        (op : rest) -> splitIntoBlocks (op : block) acc rest
+
 emitP :: Program -> ([Op], SEnv)
 emitP (Program _ defs) =
     let gF = storeDFS defs initFEnv in
         let (code, gS) = emitDFS defs gF 1 Data.Map.empty in
-            (removeRets (code []) [], gS)
+            let code' = Prelude.map (splitIntoBlocks [] []) (splitIntoFunctions [] [] (optimize (code []))) in
+                (concat (Prelude.map (lcse Data.Map.empty Data.Map.empty []) (concat code')), gS)
+                -- (concat (concat code'), gS)
+
+            -- let code' = splitIntoFunctions [] [] (optimize (code [])) in
+            --     (concat code', gS)
+
+            -- (optimize (code []), gS)
+            -- (removeRets (code []) [], gS)
 
 initFEnv :: FEnv
 initFEnv = Data.Map.fromList [
