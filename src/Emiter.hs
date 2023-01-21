@@ -446,28 +446,85 @@ emitDFS defs gF nextLab gS = case defs of
 
 ---------------------------------------------------------------------------------
 
+type Descs = Map Label [Label]
+
+splitIntoFunctions :: [Op] -> [[Op]] -> [Op] -> [[Op]]
+splitIntoFunctions fun acc ops =
+    case ops of
+        [] -> reverse acc
+        (EndFunOp : rest) -> splitIntoFunctions [] ((reverse (EndFunOp : fun)) : acc) rest
+        (op : rest) -> splitIntoFunctions (op : fun) acc rest
+
+addDesc :: Label -> Label -> Descs -> Descs
+addDesc src dest descs =
+    case Data.Map.lookup src descs of
+        Nothing -> Data.Map.insert src [dest] descs
+        Just list -> Data.Map.insert src (dest : list) descs
+
+splitIntoBlocks :: Descs -> Label -> [Op] -> [[Op]] -> [Op] -> ([[Op]], Descs)
+splitIntoBlocks descs current block acc ops =
+    case ops of
+        [] -> (reverse acc, descs)
+
+        (GoOp label : rest) -> splitIntoBlocks (addDesc current label descs) current [] ((reverse (GoOp label : block)) : acc) rest
+        (CondGoOp res label1 label2 : rest) ->
+            splitIntoBlocks (addDesc current label2 (addDesc current label1 descs)) current [] ((reverse (CondGoOp res label1 label2 : block)) : acc)  rest
+        (RetOp res : rest) -> splitIntoBlocks descs current [] ((reverse (RetOp res : block)) : acc) rest
+
+        (LabelOp label : rest) -> splitIntoBlocks descs label (LabelOp label : block) acc rest
+
+        (FunOp id regType regs : rest) -> splitIntoBlocks descs current [] ([FunOp id regType regs] : acc) rest
+        (EndFunOp : rest) -> splitIntoBlocks descs current [] ([EndFunOp] : acc) rest
+
+        (op : rest) -> splitIntoBlocks descs current (op : block) acc rest
+
+---------------------------------------------------------------------------------
+
+pushNeighbours :: [Label] -> [Label] -> Set Label -> ([Label], Set Label)
+pushNeighbours neigh stack reach =
+    case neigh of
+        [] -> (stack, reach)
+        (label : rest) ->
+            if Data.Set.member label reach then pushNeighbours rest stack reach
+            else pushNeighbours rest (label : stack) (Data.Set.insert label reach)
+
+reachable :: [Label] -> Descs -> Set Label -> Set Label
+reachable stack descs reach =
+    case stack of
+        [] -> reach
+        (label : rest) ->
+            case Data.Map.lookup label descs of
+                Just neigh ->
+                    let (stack', reach') = pushNeighbours neigh rest reach in
+                        reachable stack' descs reach'
+                Nothing -> reachable rest descs reach
+
+remove :: [[Op]] -> Set Label -> [[Op]] -> [[Op]]
+remove blocks reach acc =
+    case blocks of
+        [] -> reverse acc
+        ([FunOp id regType regs] : rest) -> remove rest reach ([FunOp id regType regs] : acc)
+        ([EndFunOp] : rest) -> remove rest reach ([EndFunOp] : acc)
+        ((LabelOp label : restBlock) : rest) ->
+            if Data.Set.member label reach then remove rest reach ((LabelOp label : restBlock) : acc)
+            else remove rest reach acc
+
+removeUnreachable :: ([[Op]], Descs) -> [[Op]]
+removeUnreachable (blocks, descs) =
+    let ([FunOp _ _ _] : (LabelOp first : _) : _) = blocks in
+        let reach = reachable [first] descs (Data.Set.fromList [first]) in
+            remove blocks reach []
+
+---------------------------------------------------------------------------------
+
 replacement :: Repl -> Res -> Res
 replacement repl res =
     case res of
         Left const -> Left const
         Right reg ->
-            if Data.Map.member reg repl then (repl ! reg)
-            else Right reg
-
-replacementPhi :: Map Label Repl -> (Res, Label) -> (Res, Label)
-replacementPhi predRepl (res, label) = (replacement (predRepl ! label) res, label)
-
-trivialPhi :: Reg -> [(Res, Label)] -> Maybe Res -> Maybe (Maybe Res)
-trivialPhi reg pairs acc =
-    case pairs of
-        [] -> Just acc
-        ((res, label) : rest) ->
-            if res == Right reg then trivialPhi reg rest acc
-            else case acc of
-                Nothing -> trivialPhi reg rest (Just res)
-                Just res' ->
-                    if res == res' then trivialPhi reg rest acc
-                    else Nothing
+            case Data.Map.lookup reg repl of
+                Just res' -> res'
+                Nothing -> Right reg
 
 replace :: Repl -> Op -> Op
 replace repl op =
@@ -532,10 +589,27 @@ fakeDest op =
         -- CallVoidOp nie umieszcza wyniku w rejestrze
         op -> Nothing -- cała reszta nie umieszcza wyniku w rejestrze
 
+trivialPhi :: Reg -> [(Res, Label)] -> Maybe Res -> Maybe (Maybe Res)
+trivialPhi reg pairs acc =
+    case pairs of
+        [] -> Just acc
+        ((res, label) : rest) ->
+            if res == Right reg then trivialPhi reg rest acc
+            else case acc of
+                Nothing -> trivialPhi reg rest (Just res)
+                Just res' ->
+                    if res == res' then trivialPhi reg rest acc
+                    else Nothing
+
 type Preds = Map Label (Set Label)
-type Descs = Map Label [Label]
 type Comp = Map Op Reg
 type Repl = Map Reg Res
+
+addPred :: Label -> Label -> Preds -> Preds
+addPred src dest preds =
+    case Data.Map.lookup dest preds of
+        Nothing -> Data.Map.insert dest (Data.Set.fromList [src]) preds
+        Just list -> Data.Map.insert dest (Data.Set.insert src list) preds
 
 -- lcse nie podmienia rejestrów używanych po prawej stronie przez phi
 lcse :: Label -> Preds -> Comp -> Repl -> [Op] -> [Op] -> ([Op], Preds, Comp, Repl)
@@ -567,7 +641,11 @@ lcse current preds comp repl acc ops =
                             Just dest' -> lcse current preds comp (Data.Map.insert dest (Right dest') repl) acc rest -- wyrażenie policzone wcześniej i wynik w dest'
                             Nothing -> lcse current preds (Data.Map.insert opRepl' dest comp) repl (opRepl : acc) rest -- wyrażenie nie policzone wcześniej
 
--- podmienia rejestry używane po prawej stronie przez phi
+
+replacementPhi :: Map Label Repl -> (Res, Label) -> (Res, Label)
+replacementPhi predRepl (res, label) = (replacement (predRepl ! label) res, label)
+
+-- adjustPhi podmienia rejestry używane po prawej stronie przez phi
 adjustPhi :: Map Label Repl -> [Op] -> [Op] -> [Op]
 adjustPhi predRepl acc ops =
     case ops of
@@ -613,48 +691,10 @@ gcseRepeat ops =
         if ops' == ops then ops'
         else gcseRepeat ops'
 
--- computeDescsFromPreds :: [(Label, Set Label)] -> Descs -> Descs
--- computeDescsFromPreds predList descs =
---     case predList of
---         [] -> descs
---         ((label, ps) : rest) ->
---             computeDescsFromPreds rest (Data.Set.foldl (addDesc label) descs ps)
+---------------------------------------------------------------------------------
 
-pushNeighbours :: [Label] -> [Label] -> Set Label -> ([Label], Set Label)
-pushNeighbours neigh stack reach =
-    case neigh of
-        [] -> (stack, reach)
-        (label : rest) ->
-            if Data.Set.member label reach then pushNeighbours rest stack reach
-            else pushNeighbours rest (label : stack) (Data.Set.insert label reach)
-
-reachable :: [Label] -> Descs -> Set Label -> Set Label
-reachable stack descs reach =
-    case stack of
-        [] -> reach
-        (label : rest) ->
-            case Data.Map.lookup label descs of
-                Just neigh ->
-                    let (stack', reach') = pushNeighbours neigh rest reach in
-                        reachable stack' descs reach'
-                Nothing -> reachable rest descs reach
-
-remove :: [[Op]] -> Set Label -> [[Op]] -> [[Op]]
-remove blocks reach acc =
-    case blocks of
-        [] -> reverse acc
-        ([FunOp id regType regs] : rest) -> remove rest reach ([FunOp id regType regs] : acc)
-        ([EndFunOp] : rest) -> remove rest reach ([EndFunOp] : acc)
-        ((LabelOp label : restBlock) : rest) ->
-            if Data.Set.member label reach then remove rest reach ((LabelOp label : restBlock) : acc)
-            else remove rest reach acc
-
-removeUnreachable :: ([[Op]], Descs) -> [[Op]]
-removeUnreachable (blocks, descs) =
-    let ([FunOp _ _ _] : (LabelOp first : _) : _) = blocks in
-        let reach = reachable [first] descs (Data.Set.fromList [first]) in
-            remove blocks reach []
-
+fakeLabel :: Label
+fakeLabel = -1
 
 optimize :: [Op] -> [Op]
 optimize ops =
@@ -663,50 +703,7 @@ optimize ops =
             let z = Prelude.map gcseRepeat y in
                 concat (concat z)
 
-splitIntoFunctions :: [Op] -> [[Op]] -> [Op] -> [[Op]]
-splitIntoFunctions fun acc ops =
-    case ops of
-        [] -> reverse acc
-        (EndFunOp : rest) -> splitIntoFunctions [] ((reverse (EndFunOp : fun)) : acc) rest
-        (op : rest) -> splitIntoFunctions (op : fun) acc rest
-
-fakeLabel :: Label
-fakeLabel = -1
-
-addDesc :: Label -> Label -> Descs -> Descs
-addDesc src dest descs =
-    case Data.Map.lookup src descs of
-        Nothing -> Data.Map.insert src [dest] descs
-        Just list -> Data.Map.insert src (dest : list) descs
-
-splitIntoBlocks :: Descs -> Label -> [Op] -> [[Op]] -> [Op] -> ([[Op]], Descs)
-splitIntoBlocks descs current block acc ops =
-    case ops of
-        [] -> (reverse acc, descs)
-
-        (GoOp label : rest) -> splitIntoBlocks (addDesc current label descs) current [] ((reverse (GoOp label : block)) : acc) rest
-        (CondGoOp res label1 label2 : rest) ->
-            splitIntoBlocks (addDesc current label2 (addDesc current label1 descs)) current [] ((reverse (CondGoOp res label1 label2 : block)) : acc)  rest
-        (RetOp res : rest) -> splitIntoBlocks descs current [] ((reverse (RetOp res : block)) : acc) rest
-
-        (LabelOp label : rest) -> splitIntoBlocks descs label (LabelOp label : block) acc rest
-
-        (FunOp id regType regs : rest) -> splitIntoBlocks descs current [] ([FunOp id regType regs] : acc) rest
-        (EndFunOp : rest) -> splitIntoBlocks descs current [] ([EndFunOp] : acc) rest
-
-        (op : rest) -> splitIntoBlocks descs current (op : block) acc rest
-
-addPred :: Label -> Label -> Preds -> Preds
-addPred src dest preds =
-    case Data.Map.lookup dest preds of
-        Nothing -> Data.Map.insert dest (Data.Set.fromList [src]) preds
-        Just list -> Data.Map.insert dest (Data.Set.insert src list) preds
-
--- addDesc :: Label -> Preds -> Label -> Preds
--- addDesc dest descs src =
---     case Data.Map.lookup src descs of
---         Nothing -> Data.Map.insert src (Data.Set.fromList [dest]) descs
---         Just list -> Data.Map.insert src (Data.Set.insert dest list) descs
+---------------------------------------------------------------------------------
 
 emitP :: Program -> ([Op], SEnv)
 emitP (Program _ defs) =
