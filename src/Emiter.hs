@@ -444,33 +444,6 @@ emitDFS defs gF nextLab gS = case defs of
             let (code'', gS'') = emitDFS rest gF nextLab' gS' in
                 (code' . code'', gS'')
 
--- removeRets :: [Op] -> [Op] -> [Op]
--- removeRets ops acc = case (ops, acc) of
---     ([], _) -> reverse acc
---     (RetOp _ : restOps, RetOp _ : restAcc) -> removeRets restOps acc
---     (op : restOps, _) -> removeRets restOps (op : acc)
-
--- reacheable :: [Op] -> [Label] -> Set Label
--- reacheable ops acc =
---     case ops of
---         [] -> Data.Set.fromList acc
---         (GoOp label : rest) -> reacheable rest (label : acc)
---         (CondGoOp _ label1 label2 : rest) -> reacheable rest (label1 : label2 : acc)
---         (_ : rest) -> reacheable rest acc
-
--- removeUnreachable :: [Op] -> Bool -> Set Label -> [Op] -> [Op]
--- removeUnreachable ops last reach acc =
---     case (ops, last) of
---         ([], _) -> reverse acc
---         (FunOp id regType regs : LabelOp label : rest, _) ->
---             removeUnreachable rest True reach (LabelOp label : FunOp id regType regs : acc)
---         (EndFunOp : rest, _) -> removeUnreachable rest last reach (EndFunOp : acc)
---         (LabelOp label : rest, _) ->
---             if Data.Set.member label reach then removeUnreachable rest True reach (LabelOp label : acc)
---             else removeUnreachable rest False reach acc
---         (op : rest, True) -> removeUnreachable rest last reach (op : acc)
---         (op : rest, False) -> removeUnreachable rest last reach acc
-
 ---------------------------------------------------------------------------------
 
 replacement :: Repl -> Res -> Res
@@ -560,6 +533,7 @@ fakeDest op =
         op -> Nothing -- cała reszta nie umieszcza wyniku w rejestrze
 
 type Preds = Map Label (Set Label)
+type Descs = Map Label [Label]
 type Comp = Map Op Reg
 type Repl = Map Reg Res
 
@@ -639,11 +613,55 @@ gcseRepeat ops =
         if ops' == ops then ops'
         else gcseRepeat ops'
 
+-- computeDescsFromPreds :: [(Label, Set Label)] -> Descs -> Descs
+-- computeDescsFromPreds predList descs =
+--     case predList of
+--         [] -> descs
+--         ((label, ps) : rest) ->
+--             computeDescsFromPreds rest (Data.Set.foldl (addDesc label) descs ps)
+
+pushNeighbours :: [Label] -> [Label] -> Set Label -> ([Label], Set Label)
+pushNeighbours neigh stack reach =
+    case neigh of
+        [] -> (stack, reach)
+        (label : rest) ->
+            if Data.Set.member label reach then pushNeighbours rest stack reach
+            else pushNeighbours rest (label : stack) (Data.Set.insert label reach)
+
+reachable :: [Label] -> Descs -> Set Label -> Set Label
+reachable stack descs reach =
+    case stack of
+        [] -> reach
+        (label : rest) ->
+            case Data.Map.lookup label descs of
+                Just neigh ->
+                    let (stack', reach') = pushNeighbours neigh rest reach in
+                        reachable stack' descs reach'
+                Nothing -> reachable rest descs reach
+
+remove :: [[Op]] -> Set Label -> [[Op]] -> [[Op]]
+remove blocks reach acc =
+    case blocks of
+        [] -> reverse acc
+        ([FunOp id regType regs] : rest) -> remove rest reach ([FunOp id regType regs] : acc)
+        ([EndFunOp] : rest) -> remove rest reach ([EndFunOp] : acc)
+        ((LabelOp label : restBlock) : rest) ->
+            if Data.Set.member label reach then remove rest reach ((LabelOp label : restBlock) : acc)
+            else remove rest reach acc
+
+removeUnreachable :: ([[Op]], Descs) -> [[Op]]
+removeUnreachable (blocks, descs) =
+    let ([FunOp _ _ _] : (LabelOp first : _) : _) = blocks in
+        let reach = reachable [first] descs (Data.Set.fromList [first]) in
+            remove blocks reach []
+
+
 optimize :: [Op] -> [Op]
 optimize ops =
-    let x = Prelude.map (splitIntoBlocks [] []) (splitIntoFunctions [] [] ops) in
-        let y = Prelude.map gcseRepeat x in
-            concat (concat y)
+    let x = Prelude.map (splitIntoBlocks Data.Map.empty fakeLabel [] []) (splitIntoFunctions [] [] ops) in
+        let y = Prelude.map removeUnreachable x in
+            let z = Prelude.map gcseRepeat y in
+                concat (concat z)
 
 splitIntoFunctions :: [Op] -> [[Op]] -> [Op] -> [[Op]]
 splitIntoFunctions fun acc ops =
@@ -655,18 +673,28 @@ splitIntoFunctions fun acc ops =
 fakeLabel :: Label
 fakeLabel = -1
 
-splitIntoBlocks :: [Op] -> [[Op]] -> [Op] -> [[Op]]
-splitIntoBlocks block acc ops =
+addDesc :: Label -> Label -> Descs -> Descs
+addDesc src dest descs =
+    case Data.Map.lookup src descs of
+        Nothing -> Data.Map.insert src [dest] descs
+        Just list -> Data.Map.insert src (dest : list) descs
+
+splitIntoBlocks :: Descs -> Label -> [Op] -> [[Op]] -> [Op] -> ([[Op]], Descs)
+splitIntoBlocks descs current block acc ops =
     case ops of
-        [] -> reverse acc
-        (GoOp label : rest) -> splitIntoBlocks [] ((reverse (GoOp label : block)) : acc) rest
-        (CondGoOp res label1 label2 : rest) -> splitIntoBlocks [] ((reverse (CondGoOp res label1 label2 : block)) : acc)  rest
-        (RetOp res : rest) -> splitIntoBlocks [] ((reverse (RetOp res : block)) : acc) rest
+        [] -> (reverse acc, descs)
 
-        (FunOp id regType regs : rest) -> splitIntoBlocks [] ([FunOp id regType regs] : acc) rest
-        (EndFunOp : rest) -> splitIntoBlocks [] ([EndFunOp] : acc) rest
+        (GoOp label : rest) -> splitIntoBlocks (addDesc current label descs) current [] ((reverse (GoOp label : block)) : acc) rest
+        (CondGoOp res label1 label2 : rest) ->
+            splitIntoBlocks (addDesc current label2 (addDesc current label1 descs)) current [] ((reverse (CondGoOp res label1 label2 : block)) : acc)  rest
+        (RetOp res : rest) -> splitIntoBlocks descs current [] ((reverse (RetOp res : block)) : acc) rest
 
-        (op : rest) -> splitIntoBlocks (op : block) acc rest
+        (LabelOp label : rest) -> splitIntoBlocks descs label (LabelOp label : block) acc rest
+
+        (FunOp id regType regs : rest) -> splitIntoBlocks descs current [] ([FunOp id regType regs] : acc) rest
+        (EndFunOp : rest) -> splitIntoBlocks descs current [] ([EndFunOp] : acc) rest
+
+        (op : rest) -> splitIntoBlocks descs current (op : block) acc rest
 
 addPred :: Label -> Label -> Preds -> Preds
 addPred src dest preds =
@@ -674,23 +702,17 @@ addPred src dest preds =
         Nothing -> Data.Map.insert dest (Data.Set.fromList [src]) preds
         Just list -> Data.Map.insert dest (Data.Set.insert src list) preds
 
+-- addDesc :: Label -> Preds -> Label -> Preds
+-- addDesc dest descs src =
+--     case Data.Map.lookup src descs of
+--         Nothing -> Data.Map.insert src (Data.Set.fromList [dest]) descs
+--         Just list -> Data.Map.insert src (Data.Set.insert dest list) descs
 
 emitP :: Program -> ([Op], SEnv)
 emitP (Program _ defs) =
     let gF = storeDFS defs initFEnv in
         let (code, gS) = emitDFS defs gF 1 Data.Map.empty in
-            -- (code [], gS)
             (optimize (code []), gS)
-            -- let code' = Prelude.map (splitIntoBlocks Data.Map.empty fakeLabel [] []) (splitIntoFunctions [] [] (optimize (code []))) in
-            --     (concat (Prelude.map (lcse Data.Map.empty Data.Map.empty []) (concat code')), gS)
-
-                -- (concat (concat code'), gS)
-
-            -- let code' = splitIntoFunctions [] [] (optimize (code [])) in
-            --     (concat code', gS)
-
-            -- (optimize (code []), gS)
-            -- (removeRets (code []) [], gS)
 
 initFEnv :: FEnv
 initFEnv = Data.Map.fromList [
