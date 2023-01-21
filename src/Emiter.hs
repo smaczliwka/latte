@@ -310,9 +310,9 @@ emitS (Ret _ exp) gV gF gB nextReg nextLab gS =
         (gV, gB, nextReg', nextLab' + 1, code' . opCode (RetOp res) . opCode (LabelOp nextLab'), gS')
         -- (gV, gB, nextReg', nextLab, code' . opCode (RetOp res), gS')
 
-emitS (VRet pos) gV gF gB nextReg nextLab gS = (gV, gB, nextReg, nextLab, opCode (RetOp (Left ConstVoid)), gS)
+emitS (VRet pos) gV gF gB nextReg nextLab gS = (gV, gB, nextReg, nextLab + 1, opCode (RetOp (Left ConstVoid)) . opCode (LabelOp nextLab), gS)
 
-emitS (Cond _  exp stmt) gV gF gB nextReg nextLab gS =
+emitS (Cond _ exp stmt) gV gF gB nextReg nextLab gS =
     let (resExp, codeExp, nextRegExp, nextLabExp, gSExp) = emitE exp (Data.Map.union gB gV) gF nextReg (nextLab + 1) gS in
         let (gVStmt, gBStmt, nextRegStmt, nextLabStmt, codeStmt, gSStmt) = emitS stmt gV gF gB nextRegExp nextLabExp gSExp in
             let (nextRegPhiV, codePhiV, gVPhi) = phi (Data.Map.toList gV) (nextLab - 1, gV) (nextLabStmt - 1, gVStmt) nextRegStmt noCode Data.Map.empty in
@@ -355,29 +355,32 @@ emitS (CondElse pos exp stmt1 stmt2) gV gF gB nextReg nextLab gS =
                         gS2)
 
 emitS (While _ exp stmt) gV gF gB nextReg nextLab gS =
-            let (gVStmt, gBStmt, nextRegStmt, nextLabStmt, codeStmt, gSStmt) = emitS stmt gV gF gB nextReg (nextLab + 1) gS in
-                let (resExp, codeExp, nextRegExp, nextLabExp, gSExp) = emitE exp (Data.Map.union gB gV) gF nextRegStmt (nextLabStmt + 1) gSStmt in
+            -- let (gVStmt, gBStmt, nextRegStmt, nextLabStmt, codeStmt, gSStmt) = emitS stmt gV gF gB nextReg (nextLab + 1) gS in
+            --     let (resExp, codeExp, nextRegExp, nextLabExp, gSExp) = emitE exp (Data.Map.union gB gV) gF nextRegStmt (nextLabStmt + 1) gSStmt in
 
-            let (nextRegPhiV, codePhiV, gVPhi) = phi (Data.Map.toList gV) (nextLab - 1, gV) (nextLabStmt - 1, gVStmt) nextRegExp noCode Data.Map.empty in
+            let (resExp, codeExp, nextRegExp, nextLabExp, gSExp) = emitE exp (Data.Map.union gB gV) gF nextReg (nextLab + 1) gS in
+                let (gVStmt, gBStmt, nextRegStmt, nextLabStmt, codeStmt, gSStmt) = emitS stmt gV gF gB nextRegExp (nextLabExp + 1) gSExp in
+
+            let (nextRegPhiV, codePhiV, gVPhi) = phi (Data.Map.toList gV) (nextLab - 1, gV) (nextLabStmt - 1, gVStmt) nextRegStmt noCode Data.Map.empty in
                 let (nextRegPhiB, codePhiB, gBPhi) = phi (Data.Map.toList gB) (nextLab - 1, gB) (nextLabStmt - 1, gBStmt) nextRegPhiV noCode Data.Map.empty in
 
-            let (gVStmt', gBStmt', nextRegStmt', nextLabStmt', codeStmt', _) = emitS stmt gVPhi gF gBPhi nextReg (nextLab + 1) gS in
-                let (resExp', codeExp', nextRegExp', _, _) = emitE exp (Data.Map.union gBPhi gVPhi) gF nextRegStmt (nextLabStmt + 1) gS in
+            let (resExp', codeExp', nextRegExp', _, _) = emitE exp (Data.Map.union gBPhi gVPhi) gF nextReg (nextLab + 1) gS in
+                let (gVStmt', gBStmt', nextRegStmt', nextLabStmt', codeStmt', _) = emitS stmt gVPhi gF gBPhi nextRegExp (nextLabExp + 1) gSExp in
 
-            (gVPhi, gBPhi, nextRegPhiB, nextLabExp + 2,
-            opCode (GoOp nextLabStmt)                               -- goto L2
+            (gVPhi, gBPhi, nextRegPhiB, nextLabStmt + 1,
+            opCode (GoOp nextLab)                               -- goto L2
 
-            . opCode (LabelOp nextLab)                              -- L1:
-            . codeStmt'                                             -- body
-            . opCode (GoOp nextLabStmt)                             -- goto L2 (potrzebne tylko dla LLVM)
-
-            . opCode (LabelOp nextLabStmt)                          -- L2:
+            . opCode (LabelOp nextLab)                          -- L2:
             . codePhiV
             . codePhiB
-            . codeExp'                                              -- condition code
-            . opCode (CondGoOp resExp nextLab (nextLabExp + 1))    -- if res goto L1 else goto LEnd
+            . codeExp'                                          -- condition code
+            . opCode (CondGoOp resExp nextLabExp nextLabStmt)   -- if res goto L1 else goto LEnd
 
-            . opCode (LabelOp (nextLabExp + 1)),                   -- LEnd (potrzebne tylko dla LLVM)
+            . opCode (LabelOp nextLabExp)                       -- L1:
+            . codeStmt'                                         -- body
+            . opCode (GoOp nextLab)                             -- goto L2 (potrzebne tylko dla LLVM)
+
+            . opCode (LabelOp nextLabStmt),                     -- LEnd (potrzebne tylko dla LLVM)
             gSExp)
 
 emitS (SExp _ exp) gV gF gB nextReg nextLab gS =
@@ -441,34 +444,36 @@ emitDFS defs gF nextLab gS = case defs of
             let (code'', gS'') = emitDFS rest gF nextLab' gS' in
                 (code' . code'', gS'')
 
-removeRets :: [Op] -> [Op] -> [Op]
-removeRets ops acc = case (ops, acc) of
-    ([], _) -> reverse acc
-    (RetOp _ : restOps, RetOp _ : restAcc) -> removeRets restOps acc
-    (op : restOps, _) -> removeRets restOps (op : acc)
+-- removeRets :: [Op] -> [Op] -> [Op]
+-- removeRets ops acc = case (ops, acc) of
+--     ([], _) -> reverse acc
+--     (RetOp _ : restOps, RetOp _ : restAcc) -> removeRets restOps acc
+--     (op : restOps, _) -> removeRets restOps (op : acc)
 
-reacheable :: [Op] -> [Label] -> Set Label
-reacheable ops acc =
-    case ops of
-        [] -> Data.Set.fromList acc
-        (GoOp label : rest) -> reacheable rest (label : acc)
-        (CondGoOp _ label1 label2 : rest) -> reacheable rest (label1 : label2 : acc)
-        (_ : rest) -> reacheable rest acc
+-- reacheable :: [Op] -> [Label] -> Set Label
+-- reacheable ops acc =
+--     case ops of
+--         [] -> Data.Set.fromList acc
+--         (GoOp label : rest) -> reacheable rest (label : acc)
+--         (CondGoOp _ label1 label2 : rest) -> reacheable rest (label1 : label2 : acc)
+--         (_ : rest) -> reacheable rest acc
 
-removeUnreachable :: [Op] -> Bool -> Set Label -> [Op] -> [Op]
-removeUnreachable ops last reach acc =
-    case (ops, last) of
-        ([], _) -> reverse acc
-        (FunOp id regType regs : LabelOp label : rest, _) ->
-            removeUnreachable rest True reach (LabelOp label : FunOp id regType regs : acc)
-        (EndFunOp : rest, _) -> removeUnreachable rest last reach (EndFunOp : acc)
-        (LabelOp label : rest, _) ->
-            if Data.Set.member label reach then removeUnreachable rest True reach (LabelOp label : acc)
-            else removeUnreachable rest False reach acc
-        (op : rest, True) -> removeUnreachable rest last reach (op : acc)
-        (op : rest, False) -> removeUnreachable rest last reach acc
+-- removeUnreachable :: [Op] -> Bool -> Set Label -> [Op] -> [Op]
+-- removeUnreachable ops last reach acc =
+--     case (ops, last) of
+--         ([], _) -> reverse acc
+--         (FunOp id regType regs : LabelOp label : rest, _) ->
+--             removeUnreachable rest True reach (LabelOp label : FunOp id regType regs : acc)
+--         (EndFunOp : rest, _) -> removeUnreachable rest last reach (EndFunOp : acc)
+--         (LabelOp label : rest, _) ->
+--             if Data.Set.member label reach then removeUnreachable rest True reach (LabelOp label : acc)
+--             else removeUnreachable rest False reach acc
+--         (op : rest, True) -> removeUnreachable rest last reach (op : acc)
+--         (op : rest, False) -> removeUnreachable rest last reach acc
 
-replacement :: Map Reg Reg -> Res -> Res
+---------------------------------------------------------------------------------
+
+replacement :: Repl -> Res -> Res
 replacement repl res =
     case res of
         Left const -> Left const
@@ -476,10 +481,10 @@ replacement repl res =
             if Data.Map.member reg repl then Right (repl ! reg)
             else Right reg
 
-replacementPhi :: Map Reg Reg -> (Res, Label) -> (Res, Label)
-replacementPhi repl (res, label) = (replacement repl res, label)
+replacementPhi :: Map Label Repl -> (Res, Label) -> (Res, Label)
+replacementPhi predRepl (res, label) = (replacement (predRepl ! label) res, label)
 
-replace :: Map Reg Reg -> Op -> Op
+replace :: Repl -> Op -> Op
 replace repl op =
     case op of
         PlusOp reg res1 res2 -> PlusOp reg (replacement repl res1) (replacement repl res2)
@@ -502,7 +507,7 @@ replace repl op =
         CallOp reg id results -> CallOp reg id (Prelude.map (replacement repl) results)
         RetOp res -> RetOp (replacement repl res)
         -- LabelOp nie korzysta z rejestrów
-        PhiOp reg pairs -> PhiOp reg (Prelude.map (replacementPhi repl) pairs) -- trzeba jeszcze usuwać powtórzenia
+        -- PhiOp reg pairs -> PhiOp reg (Prelude.map (replacementPhi repl) pairs) -- trzeba jeszcze usuwać powtórzenia (fromList [((RegInt, 3), (RegInt, 1)), ((RegInt, 4), (RegInt, 1))])
         -- FunOp nie korzysta z rejestrów
         -- BitcastOp nie korzysta z rejestrów
         -- EndFunOp nie korzysta z rejestrów
@@ -542,27 +547,81 @@ fakeDest op =
         -- CallVoidOp nie umieszcza wyniku w rejestrze
         op -> Nothing -- cała reszta nie umieszcza wyniku w rejestrze
 
-lcse :: Map Op Reg -> Map Reg Reg -> [Op] -> [Op] -> [Op]
-lcse comp repl acc ops =
+type Preds = Map Label [Label]
+type Comp = Map Op Reg
+type Repl = Map Reg Reg
+
+-- lcse nie podmienia rejestrów używanych po prawej stronie przez phi
+lcse :: Label -> Preds -> Comp -> Repl -> [Op] -> [Op] -> ([Op], Preds, Comp, Repl)
+lcse current preds comp repl acc ops =
     case ops of
 
-        [FunOp id regType regs] -> [FunOp id regType regs]
-        [EndFunOp] -> [EndFunOp]
+        [FunOp id regType regs] -> ([FunOp id regType regs], preds, comp, repl)
+        [EndFunOp] -> ([EndFunOp], preds, comp, repl)
 
-        [] -> reverse acc
+        [] -> (reverse acc, preds, comp, repl)
+
+        (GoOp label : rest) ->
+            lcse current (addPred current label preds) comp repl (GoOp label : acc) rest
+        (CondGoOp res label1 label2 : rest) ->
+            lcse current (addPred current label2 (addPred current label1 preds)) comp repl (CondGoOp res label1 label2 : acc) rest
+
+        -- (PhiOp reg pairs : rest) ->
+
+
         (op : rest) ->
             let opRepl = replace repl op in
                 case fakeDest opRepl of
-                    Nothing -> lcse comp repl (opRepl : acc) rest -- operacja nie umieszcza wyniku w rejestrze
+                    Nothing -> lcse current preds comp repl (opRepl : acc) rest -- operacja nie umieszcza wyniku w rejestrze
                     Just (opRepl', dest) ->
                         case Data.Map.lookup opRepl' comp of
-                            Just dest' -> lcse comp (insert dest dest' repl) acc rest -- wyrażenie policzone wcześniej i wynik w dest'
-                            Nothing -> lcse (insert opRepl' dest comp) repl (opRepl : acc) rest -- wyrażenie nie policzone wcześniej
+                            Just dest' -> lcse current preds comp (insert dest dest' repl) acc rest -- wyrażenie policzone wcześniej i wynik w dest'
+                            Nothing -> lcse current preds (insert opRepl' dest comp) repl (opRepl : acc) rest -- wyrażenie nie policzone wcześniej
+
+-- podmienia rejestry używane po prawej stronie przez phi
+adjustPhi :: Map Label Repl -> [Op] -> [Op] -> [Op]
+adjustPhi predRepl acc ops =
+    case ops of
+        [] -> reverse acc
+        (PhiOp reg pairs : rest) -> adjustPhi predRepl (PhiOp reg (Prelude.map (replacementPhi predRepl) pairs) : acc) rest
+        (op : rest) -> adjustPhi predRepl (op : acc) rest
+
+combineLists :: Ord a => [a] -> [a] -> [a] -> [a]
+combineLists l1 l2 acc =
+    case (l1, l2) of
+        ([], _) -> acc
+        (_, []) -> acc
+        (e1 : rest1, e2 : rest2) ->
+            if (e1 < e2) then combineLists rest1 l2 acc
+            else
+                if (e1 > e2) then combineLists l1 rest2 acc
+                else combineLists rest1 rest2 (e1 : acc)
+
+combineMaps :: Ord a => Ord b => Map a b -> Map a b -> Map a b
+combineMaps m1 m2 = Data.Map.fromList (combineLists (Data.Map.toList m1) (Data.Map.toList m2) [])
+
+gcse :: Preds -> Map Label Comp -> Map Label Repl -> [[Op]] -> [[Op]] -> [[Op]]
+gcse preds predComp predRepl acc blocks =
+    case blocks of
+        [] -> Prelude.map (adjustPhi predRepl []) (reverse acc)
+        ([FunOp id regType regs] : rest) -> gcse preds predComp predRepl ([FunOp id regType regs] : acc) rest
+        ([EndFunOp] : rest) -> gcse preds predComp predRepl ([EndFunOp] : acc) rest
+        ((LabelOp label : restBlock) : rest) ->
+            case Data.Map.lookup label preds of
+                Nothing ->
+                    let (block', preds', comp', repl') = lcse label preds Data.Map.empty Data.Map.empty [] (LabelOp label : restBlock) in
+                        gcse preds' (insert label comp' predComp) (insert label repl' predRepl) (block' : acc) rest
+                Just (p : restP) ->
+                    let comp = Prelude.foldl combineMaps (predComp ! p) (Prelude.map (predComp !) restP) in
+                        let repl = Prelude.foldl combineMaps (predRepl ! p) (Prelude.map (predRepl !) restP) in
+                            let (block', preds', comp', repl') = lcse label preds comp repl [] (LabelOp label : restBlock) in
+                                gcse preds' (insert label comp' predComp) (insert label repl' predRepl) (block' : acc) rest
 
 optimize :: [Op] -> [Op]
 optimize ops =
-    let reach = reacheable ops [] in
-        removeUnreachable ops True reach []
+    let x = Prelude.map (splitIntoBlocks [] []) (splitIntoFunctions [] [] ops) in
+        let y = Prelude.map (gcse Data.Map.empty Data.Map.empty Data.Map.empty []) x in
+            concat (concat y)
 
 splitIntoFunctions :: [Op] -> [[Op]] -> [Op] -> [[Op]]
 splitIntoFunctions fun acc ops =
@@ -570,6 +629,9 @@ splitIntoFunctions fun acc ops =
         [] -> reverse acc
         (EndFunOp : rest) -> splitIntoFunctions [] ((reverse (EndFunOp : fun)) : acc) rest
         (op : rest) -> splitIntoFunctions (op : fun) acc rest
+
+fakeLabel :: Label
+fakeLabel = -1
 
 splitIntoBlocks :: [Op] -> [[Op]] -> [Op] -> [[Op]]
 splitIntoBlocks block acc ops =
@@ -584,12 +646,22 @@ splitIntoBlocks block acc ops =
 
         (op : rest) -> splitIntoBlocks (op : block) acc rest
 
+addPred :: Label -> Label -> Preds -> Preds
+addPred src dest preds =
+    case Data.Map.lookup dest preds of
+        Nothing -> insert dest [src] preds
+        Just list -> insert dest (src : list) preds
+
+
 emitP :: Program -> ([Op], SEnv)
 emitP (Program _ defs) =
     let gF = storeDFS defs initFEnv in
         let (code, gS) = emitDFS defs gF 1 Data.Map.empty in
-            let code' = Prelude.map (splitIntoBlocks [] []) (splitIntoFunctions [] [] (optimize (code []))) in
-                (concat (Prelude.map (lcse Data.Map.empty Data.Map.empty []) (concat code')), gS)
+            -- (code [], gS)
+            (optimize (code []), gS)
+            -- let code' = Prelude.map (splitIntoBlocks Data.Map.empty fakeLabel [] []) (splitIntoFunctions [] [] (optimize (code []))) in
+            --     (concat (Prelude.map (lcse Data.Map.empty Data.Map.empty []) (concat code')), gS)
+
                 -- (concat (concat code'), gS)
 
             -- let code' = splitIntoFunctions [] [] (optimize (code [])) in
