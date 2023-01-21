@@ -2,7 +2,7 @@ module Emiter where
 
 import AbsLatte
 import Data.Map
-import Data.Set (Set, fromList, member)
+import Data.Set
 
 data RegType = RegInt | RegStr | RegBool | RegVoid
     deriving (Eq, Ord)
@@ -418,7 +418,7 @@ emitDF (FnDef pos t id args block) gF nextLab gS =
                         . opCode EndFunOp,
                         gS')
                     else
-                        let idx = toInteger (size gS') in
+                        let idx = toInteger (Data.Map.size gS') in
                             (nextLab',
                             opCode (FunOp id (typeRegType t) argList)
                             . opCode (LabelOp nextLab)
@@ -426,7 +426,7 @@ emitDF (FnDef pos t id args block) gF nextLab gS =
                             . opCode (BitcastOp dest 0 idx)
                             . opCode (RetOp (Right (RegStr, nextReg')))
                             . opCode EndFunOp,
-                            insert "" idx gS')
+                            Data.Map.insert "" idx gS')
                 _ ->
                     (nextLab',
                     opCode (FunOp id (typeRegType t) argList)
@@ -478,11 +478,23 @@ replacement repl res =
     case res of
         Left const -> Left const
         Right reg ->
-            if Data.Map.member reg repl then Right (repl ! reg)
+            if Data.Map.member reg repl then (repl ! reg)
             else Right reg
 
 replacementPhi :: Map Label Repl -> (Res, Label) -> (Res, Label)
 replacementPhi predRepl (res, label) = (replacement (predRepl ! label) res, label)
+
+trivialPhi :: Reg -> [(Res, Label)] -> Maybe Res -> Maybe (Maybe Res)
+trivialPhi reg pairs acc =
+    case pairs of
+        [] -> Just acc
+        ((res, label) : rest) ->
+            if res == Right reg then trivialPhi reg rest acc
+            else case acc of
+                Nothing -> trivialPhi reg rest (Just res)
+                Just res' ->
+                    if res == res' then trivialPhi reg rest acc
+                    else Nothing
 
 replace :: Repl -> Op -> Op
 replace repl op =
@@ -547,9 +559,9 @@ fakeDest op =
         -- CallVoidOp nie umieszcza wyniku w rejestrze
         op -> Nothing -- cała reszta nie umieszcza wyniku w rejestrze
 
-type Preds = Map Label [Label]
+type Preds = Map Label (Set Label)
 type Comp = Map Op Reg
-type Repl = Map Reg Reg
+type Repl = Map Reg Res
 
 -- lcse nie podmienia rejestrów używanych po prawej stronie przez phi
 lcse :: Label -> Preds -> Comp -> Repl -> [Op] -> [Op] -> ([Op], Preds, Comp, Repl)
@@ -566,8 +578,11 @@ lcse current preds comp repl acc ops =
         (CondGoOp res label1 label2 : rest) ->
             lcse current (addPred current label2 (addPred current label1 preds)) comp repl (CondGoOp res label1 label2 : acc) rest
 
-        -- (PhiOp reg pairs : rest) ->
-
+        (PhiOp reg pairs : rest) ->
+            case trivialPhi reg pairs Nothing of
+                Nothing -> lcse current preds comp repl (PhiOp reg pairs : acc) rest -- zostawiamy phi i nie zastępujemy reg
+                Just (Just res) -> lcse current preds comp (Data.Map.insert reg res repl) acc rest -- usuwamy phi i zastępujemy reg przez res
+                Just (Nothing) -> lcse current preds comp repl acc rest -- usuwamy phi i nie zastępujemy reg
 
         (op : rest) ->
             let opRepl = replace repl op in
@@ -575,8 +590,8 @@ lcse current preds comp repl acc ops =
                     Nothing -> lcse current preds comp repl (opRepl : acc) rest -- operacja nie umieszcza wyniku w rejestrze
                     Just (opRepl', dest) ->
                         case Data.Map.lookup opRepl' comp of
-                            Just dest' -> lcse current preds comp (insert dest dest' repl) acc rest -- wyrażenie policzone wcześniej i wynik w dest'
-                            Nothing -> lcse current preds (insert opRepl' dest comp) repl (opRepl : acc) rest -- wyrażenie nie policzone wcześniej
+                            Just dest' -> lcse current preds comp (Data.Map.insert dest (Right dest') repl) acc rest -- wyrażenie policzone wcześniej i wynik w dest'
+                            Nothing -> lcse current preds (Data.Map.insert opRepl' dest comp) repl (opRepl : acc) rest -- wyrażenie nie policzone wcześniej
 
 -- podmienia rejestry używane po prawej stronie przez phi
 adjustPhi :: Map Label Repl -> [Op] -> [Op] -> [Op]
@@ -610,17 +625,24 @@ gcse preds predComp predRepl acc blocks =
             case Data.Map.lookup label preds of
                 Nothing ->
                     let (block', preds', comp', repl') = lcse label preds Data.Map.empty Data.Map.empty [] (LabelOp label : restBlock) in
-                        gcse preds' (insert label comp' predComp) (insert label repl' predRepl) (block' : acc) rest
-                Just (p : restP) ->
-                    let comp = Prelude.foldl combineMaps (predComp ! p) (Prelude.map (predComp !) restP) in
-                        let repl = Prelude.foldl combineMaps (predRepl ! p) (Prelude.map (predRepl !) restP) in
-                            let (block', preds', comp', repl') = lcse label preds comp repl [] (LabelOp label : restBlock) in
-                                gcse preds' (insert label comp' predComp) (insert label repl' predRepl) (block' : acc) rest
+                        gcse preds' (Data.Map.insert label comp' predComp) (Data.Map.insert label repl' predRepl) (block' : acc) rest
+                Just ps ->
+                    let (p : restP) = Data.Set.toList ps in
+                        let comp = Prelude.foldl combineMaps (predComp ! p) (Prelude.map (predComp !) restP) in
+                            let repl = Prelude.foldl combineMaps (predRepl ! p) (Prelude.map (predRepl !) restP) in
+                                let (block', preds', comp', repl') = lcse label preds comp repl [] (LabelOp label : restBlock) in
+                                    gcse preds' (Data.Map.insert label comp' predComp) (Data.Map.insert label repl' predRepl) (block' : acc) rest
+
+gcseRepeat :: [[Op]] -> [[Op]]
+gcseRepeat ops =
+    let ops' = gcse Data.Map.empty Data.Map.empty Data.Map.empty [] ops in
+        if ops' == ops then ops'
+        else gcseRepeat ops'
 
 optimize :: [Op] -> [Op]
 optimize ops =
     let x = Prelude.map (splitIntoBlocks [] []) (splitIntoFunctions [] [] ops) in
-        let y = Prelude.map (gcse Data.Map.empty Data.Map.empty Data.Map.empty []) x in
+        let y = Prelude.map gcseRepeat x in
             concat (concat y)
 
 splitIntoFunctions :: [Op] -> [[Op]] -> [Op] -> [[Op]]
@@ -649,8 +671,8 @@ splitIntoBlocks block acc ops =
 addPred :: Label -> Label -> Preds -> Preds
 addPred src dest preds =
     case Data.Map.lookup dest preds of
-        Nothing -> insert dest [src] preds
-        Just list -> insert dest (src : list) preds
+        Nothing -> Data.Map.insert dest (Data.Set.fromList [src]) preds
+        Just list -> Data.Map.insert dest (Data.Set.insert src list) preds
 
 
 emitP :: Program -> ([Op], SEnv)
