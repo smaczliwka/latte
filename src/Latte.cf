@@ -6,6 +6,8 @@ Program.   Program ::= [TopDef] ;
 
 FnDef.	   TopDef ::= Type Ident "(" [Arg] ")" Block ;
 
+InlFnDef.  TopDef ::= "inline" Type Ident "(" [Arg] ")" Block ;
+
 separator nonempty TopDef "" ;
 
 Arg. 	   Arg ::= Type Ident;

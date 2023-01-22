@@ -394,6 +394,8 @@ storeDFS defs gF = case defs of
     [] -> gF
     (FnDef pos t id args block : rest) ->
         storeDFS rest (Data.Map.insert id (typeRegType t) gF)
+    (InlFnDef pos t id args block : rest) ->
+        storeDFS rest (Data.Map.insert id (typeRegType t) gF)
 
 mapArgs :: [Arg] -> VEnv -> RegNum -> [Reg] -> (VEnv, RegNum, [Reg])
 mapArgs args gV nextReg argList = case args of
@@ -435,6 +437,8 @@ emitDF (FnDef pos t id args block) gF nextLab gS =
                     . opCode (RetOp (typeDefault t))
                     . opCode EndFunOp,
                     gS')
+
+emitDF (InlFnDef pos t id args block) gF nextLab gS = emitDF (FnDef pos t id args block) gF nextLab gS
 
 emitDFS :: [TopDef] -> FEnv -> Label -> SEnv -> (Code, SEnv)
 emitDFS defs gF nextLab gS = case defs of
