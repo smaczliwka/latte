@@ -562,17 +562,17 @@ fakeReg = (RegVoid, -1)
 fakeDest :: Op -> Maybe (Op, Reg)
 fakeDest op =
     case op of
-        PlusOp reg res1 res2 -> Just (PlusOp fakeReg res1 res2, reg)
+        PlusOp reg res1 res2 -> Just (PlusOp fakeReg (min res1 res2) (max res1 res2), reg)
         MinusOp reg res1 res2 -> Just (MinusOp fakeReg res1 res2, reg)
-        TimesOp reg res1 res2 -> Just (TimesOp fakeReg res1 res2, reg)
+        TimesOp reg res1 res2 -> Just (TimesOp fakeReg (min res1 res2) (max res1 res2), reg)
         DivOp reg res1 res2 -> Just (DivOp fakeReg res1 res2, reg)
         ModOp reg res1 res2 -> Just (ModOp fakeReg res1 res2, reg)
         LTHOp reg res1 res2 -> Just (LTHOp fakeReg res1 res2, reg)
         LEOp reg res1 res2 -> Just (LEOp fakeReg res1 res2, reg)
         GTHOp reg res1 res2 -> Just (GTHOp fakeReg res1 res2, reg)
         GEOp reg res1 res2 -> Just (GEOp fakeReg res1 res2, reg)
-        EQUOp reg res1 res2 -> Just (EQUOp fakeReg res1 res2, reg)
-        NEOp reg res1 res2 -> Just (NEOp fakeReg res1 res2, reg)
+        EQUOp reg res1 res2 -> Just (EQUOp fakeReg (min res1 res2) (max res1 res2), reg)
+        NEOp reg res1 res2 -> Just (NEOp fakeReg (min res1 res2) (max res1 res2), reg)
         -- AndOp i
         -- OrOp nieużywane
         NotOp reg res -> Just (NotOp fakeReg res, reg)
@@ -624,7 +624,7 @@ lcse current preds comp repl acc ops =
         (GoOp label : rest) ->
             lcse current (addPred current label preds) comp repl (GoOp label : acc) rest
         (CondGoOp res label1 label2 : rest) ->
-            lcse current (addPred current label2 (addPred current label1 preds)) comp repl (CondGoOp res label1 label2 : acc) rest
+            lcse current (addPred current label2 (addPred current label1 preds)) comp repl (replace repl (CondGoOp res label1 label2) : acc) rest
 
         (PhiOp reg pairs : rest) ->
             case trivialPhi reg pairs Nothing of
