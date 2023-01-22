@@ -74,36 +74,81 @@ noCode rest = rest
 type Code = [Op] -> [Op]
 type VEnv = Map Ident Res
 type FEnv = Map Ident RegType
+type IEnv = Map Ident (Type, [Arg], Block)
 
 type StrNum = Integer
 type SEnv = Map String StrNum
 
-emitArgs :: [Expr] -> VEnv -> FEnv -> ([Res], Code, RegNum, Label, SEnv) -> ([Res], Code, RegNum, Label, SEnv)
-emitArgs exps gV gF (args, codes, nextReg, nextLab, gS) = case exps of
+emitArgs :: [Expr] -> VEnv -> FEnv -> IEnv -> ([Res], Code, RegNum, Label, SEnv) -> ([Res], Code, RegNum, Label, SEnv)
+emitArgs exps gV gF gI (args, codes, nextReg, nextLab, gS) = case exps of
     [] -> (reverse args, codes, nextReg, nextLab, gS)
     (exp : rest) ->
-        let (arg, code, nextReg', nextLab', gS') = emitE exp gV gF nextReg nextLab gS in
-            emitArgs rest gV gF (arg : args, codes . code, nextReg', nextLab', gS')
+        let (arg, code, nextReg', nextLab', gS') = emitE exp gV gF gI nextReg nextLab gS in
+            emitArgs rest gV gF gI (arg : args, codes . code, nextReg', nextLab', gS')
 
-emitE :: Expr -> VEnv -> FEnv -> RegNum -> Label -> SEnv -> (Res, Code, RegNum, Label, SEnv)
+emitE :: Expr -> VEnv -> FEnv -> IEnv -> RegNum -> Label -> SEnv -> (Res, Code, RegNum, Label, SEnv)
 
-emitE (EVar pos id) gV gF nextReg nextLab gS = (gV ! id, noCode, nextReg, nextLab, gS)
+emitE (EVar pos id) gV gF gI nextReg nextLab gS = (gV ! id, noCode, nextReg, nextLab, gS)
 
-emitE (ELitInt pos val) gV gF nextReg nextLab gS = (Left (ConstInt val), noCode, nextReg, nextLab, gS)
+emitE (ELitInt pos val) gV gF gI nextReg nextLab gS = (Left (ConstInt val), noCode, nextReg, nextLab, gS)
 
-emitE (ELitTrue pos) gV gF nextReg nextLab gS = (Left (ConstBool True), noCode, nextReg, nextLab, gS)
-emitE (ELitFalse pos) gV gF nextReg nextLab gS = (Left (ConstBool False), noCode, nextReg, nextLab, gS)
+emitE (ELitTrue pos) gV gF gI nextReg nextLab gS = (Left (ConstBool True), noCode, nextReg, nextLab, gS)
+emitE (ELitFalse pos) gV gF gI nextReg nextLab gS = (Left (ConstBool False), noCode, nextReg, nextLab, gS)
 
-emitE (EApp pos id exps) gV gF nextReg nextLab gS =
-    let (args, codes, nextReg', nextLab', gS') = emitArgs exps gV gF ([], noCode, nextReg, nextLab, gS) in
-        let regType = gF ! id in
-            case regType of
-                RegVoid -> (Left ConstVoid, codes . opCode (CallVoidOp id args), nextReg', nextLab', gS')
-                _ ->
-                    let dest = (regType, nextReg') in
-                        (Right dest, codes . opCode (CallOp dest id args), nextReg' + 1, nextLab', gS')
+emitE (EApp pos id exps) gV gF gI nextReg nextLab gS =
+    let (results, codes, nextReg', nextLab', gS') = emitArgs exps gV gF gI ([], noCode, nextReg, nextLab, gS) in
+        if Data.Map.member id gF then
+            let regType = gF ! id in
+                case regType of
+                    RegVoid -> (Left ConstVoid, codes . opCode (CallVoidOp id results), nextReg', nextLab', gS')
+                    _ ->
+                        let dest = (regType, nextReg') in
+                            (Right dest, codes . opCode (CallOp dest id results), nextReg' + 1, nextLab', gS')
+        else
+            let (t, args, block) = gI ! id in
+                let gB = mapArgsInl args results Data.Map.empty in
+                    let (_, _, _, phiLab, _, _, _) = emitB block Data.Map.empty gF gI gB nextReg' nextLab' gS' Nothing [] in
+                        let (_, _, nextReg'', _, code'', gS'', phiPairs) = emitB block Data.Map.empty gF gI gB nextReg' nextLab' gS' (Just (Right phiLab)) [] in
+                            let regType = typeRegType t in
+                                case t of
+                                    Void _ ->
+                                        (Right (regType, nextReg''),
+                                        codes
+                                        . code''
+                                        . opCode (GoOp phiLab)
+                                        . opCode (LabelOp phiLab),
+                                        nextReg'' + 1, phiLab + 1, gS'')
 
-emitE (EString pos str) gV gF nextReg nextLab gS =
+                                    Str _ ->
+                                        if Data.Map.member "" gS'' then
+                                            (Right (regType, nextReg'' + 1),
+                                            codes
+                                            . code''
+                                            . opCode (BitcastOp (RegStr, nextReg'') 0 (gS'' ! ""))
+                                            . opCode (GoOp phiLab)
+                                            . opCode (LabelOp phiLab)
+                                            . opCode (PhiOp (RegStr, nextReg'' + 1) ((Right (RegStr, nextReg''), phiLab - 1) : phiPairs)),
+                                            nextReg'' + 2, phiLab + 1, gS'')
+                                        else
+                                            let idx = toInteger (Data.Map.size gS'') in
+                                                (Right (regType, nextReg'' + 1),
+                                                codes
+                                                . code''
+                                                . opCode (BitcastOp (RegStr, nextReg'') 0 idx)
+                                                . opCode (GoOp phiLab)
+                                                . opCode (LabelOp phiLab)
+                                                . opCode (PhiOp (RegStr, nextReg'' + 1) ((Right (RegStr, nextReg''), phiLab - 1) : phiPairs)),
+                                                nextReg'' + 2, phiLab + 1, Data.Map.insert "" idx gS'')
+                                    _ ->
+                                        (Right (regType, nextReg''),
+                                        codes
+                                        . code''
+                                        . opCode (GoOp phiLab)
+                                        . opCode (LabelOp phiLab)
+                                        . opCode (PhiOp (typeRegType t, nextReg'') ((typeDefault t, phiLab - 1) : phiPairs)),
+                                        nextReg'' + 1, phiLab + 1, gS'')
+
+emitE (EString pos str) gV gF gI nextReg nextLab gS =
     let dest = (RegStr, nextReg) in
         let len = toInteger (length str) in
             if Data.Map.member str gS then
@@ -112,35 +157,35 @@ emitE (EString pos str) gV gF nextReg nextLab gS =
                 let idx = toInteger (Data.Map.size gS) in
                     (Right dest, opCode (BitcastOp dest len idx), nextReg + 1, nextLab, Data.Map.insert str idx gS)
 
-emitE (Not pos exp) gV gF nextReg nextLab gS = -- negacja binarna
-    let (res, code, nextReg', nextLab', gS') = emitE exp gV gF nextReg nextLab gS in
+emitE (Not pos exp) gV gF gI nextReg nextLab gS = -- negacja binarna
+    let (res, code, nextReg', nextLab', gS') = emitE exp gV gF gI nextReg nextLab gS in
         (Right (RegBool, nextReg'), code . opCode (NotOp (RegBool, nextReg') res), nextReg' + 1, nextLab', gS')
 
-emitE (Neg pos exp) gV gF nextReg nextLab gS = -- minus
-    let (res, code, nextReg', nextLab', gS') = emitE exp gV gF nextReg nextLab gS in
+emitE (Neg pos exp) gV gF gI nextReg nextLab gS = -- minus
+    let (res, code, nextReg', nextLab', gS') = emitE exp gV gF gI nextReg nextLab gS in
         (Right (RegInt, nextReg'), code . opCode (NegOp (RegInt, nextReg') res), nextReg' + 1, nextLab', gS')
 
-emitE (EMul pos exp1 op exp2) gV gF nextReg nextLab gS =
-    let (res1, code1, nextReg1, nextLab1, gS1) = emitE exp1 gV gF nextReg nextLab gS in
-        let (res2, code2, nextReg2, nextLab2, gS2) = emitE exp2 gV gF nextReg1 nextLab1 gS1 in
+emitE (EMul pos exp1 op exp2) gV gF gI nextReg nextLab gS =
+    let (res1, code1, nextReg1, nextLab1, gS1) = emitE exp1 gV gF gI nextReg nextLab gS in
+        let (res2, code2, nextReg2, nextLab2, gS2) = emitE exp2 gV gF gI nextReg1 nextLab1 gS1 in
             let dest = (RegInt, nextReg2) in
                 case op of
                     Times _ -> (Right dest, code1 . code2 . opCode (TimesOp dest res1 res2), nextReg2 + 1, nextLab2, gS2)
                     Div _ -> (Right dest, code1 . code2 . opCode (DivOp dest res1 res2), nextReg2 + 1, nextLab2, gS2)
                     Mod _ -> (Right dest, code1 . code2 . opCode (ModOp dest res1 res2), nextReg2 + 1, nextLab2, gS2)
 
-emitE (EAdd pos exp1 op exp2) gV gF nextReg nextLab gS =
-    let (res1, code1, nextReg1, nextLab1, gS1) = emitE exp1 gV gF nextReg nextLab gS in
-        let (res2, code2, nextReg2, nextLab2, gS2) = emitE exp2 gV gF nextReg1 nextLab1 gS1 in
+emitE (EAdd pos exp1 op exp2) gV gF gI nextReg nextLab gS =
+    let (res1, code1, nextReg1, nextLab1, gS1) = emitE exp1 gV gF gI nextReg nextLab gS in
+        let (res2, code2, nextReg2, nextLab2, gS2) = emitE exp2 gV gF gI nextReg1 nextLab1 gS1 in
             let dest = (resRegType res1, nextReg2) in
                 case op of
                     Plus _ -> (Right dest, code1 . code2 . opCode (PlusOp dest res1 res2), nextReg2 + 1, nextLab2, gS2)
                     Minus _ -> (Right dest, code1 . code2 . opCode (MinusOp dest res1 res2), nextReg2 + 1, nextLab2, gS2)
 
 -- przewiduje porównywanie wszystkich typów poza void
-emitE (ERel pos exp1 op exp2) gV gF nextReg nextLab gS =
-    let (res1, code1, nextReg1, nextLab1, gS1) = emitE exp1 gV gF nextReg nextLab gS in
-        let (res2, code2, nextReg2, nextLab2, gS2) = emitE exp2 gV gF nextReg1 nextLab1 gS1 in
+emitE (ERel pos exp1 op exp2) gV gF gI nextReg nextLab gS =
+    let (res1, code1, nextReg1, nextLab1, gS1) = emitE exp1 gV gF gI nextReg nextLab gS in
+        let (res2, code2, nextReg2, nextLab2, gS2) = emitE exp2 gV gF gI nextReg1 nextLab1 gS1 in
             let dest = (RegBool, nextReg2) in
                 case op of
                     LTH _ -> (Right dest, code1 . code2 . opCode (LTHOp dest res1 res2), nextReg2 + 1, nextLab2, gS2)
@@ -150,9 +195,9 @@ emitE (ERel pos exp1 op exp2) gV gF nextReg nextLab gS =
                     EQU _ -> (Right dest, code1 . code2 . opCode (EQUOp dest res1 res2), nextReg2 + 1, nextLab2, gS2)
                     NE _ -> (Right dest, code1 . code2 . opCode (NEOp dest res1 res2), nextReg2 + 1, nextLab2, gS2)
 
-emitE (EAnd pos exp1 exp2) gV gF nextReg nextLab gS =
+emitE (EAnd pos exp1 exp2) gV gF gI nextReg nextLab gS =
     let (lTrue, lFalse) = (nextLab, nextLab + 1) in
-        let (code, nextReg', nextLab', gS') = emitL (EAnd pos exp1 exp2) gV gF nextReg (nextLab + 2) gS lTrue lFalse in
+        let (code, nextReg', nextLab', gS') = emitL (EAnd pos exp1 exp2) gV gF gI nextReg (nextLab + 2) gS lTrue lFalse in
             (Right (RegBool, nextReg'),
             code
             . opCode (LabelOp lTrue)
@@ -163,9 +208,9 @@ emitE (EAnd pos exp1 exp2) gV gF nextReg nextLab gS =
             . opCode (PhiOp (RegBool, nextReg') [(Left (ConstBool True), lTrue), (Left (ConstBool False), lFalse)]),
             nextReg' + 1, nextLab' + 1, gS')
 
-emitE (EOr pos exp1 exp2) gV gF nextReg nextLab gS =
+emitE (EOr pos exp1 exp2) gV gF gI nextReg nextLab gS =
     let (lTrue, lFalse) = (nextLab, nextLab + 1) in
-        let (code, nextReg', nextLab', gS') = emitL (EOr pos exp1 exp2) gV gF nextReg (nextLab + 2) gS lTrue lFalse in
+        let (code, nextReg', nextLab', gS') = emitL (EOr pos exp1 exp2) gV gF gI nextReg (nextLab + 2) gS lTrue lFalse in
             (Right (RegBool, nextReg'),
             code
             . opCode (LabelOp lTrue)
@@ -178,31 +223,40 @@ emitE (EOr pos exp1 exp2) gV gF nextReg nextLab gS =
 
 ---------------------------------------------------------------------------------
 
-emitL :: Expr -> VEnv -> FEnv -> RegNum -> Label -> SEnv -> Label -> Label -> (Code, RegNum, Label, SEnv)
+emitL :: Expr -> VEnv -> FEnv -> IEnv -> RegNum -> Label -> SEnv -> Label -> Label -> (Code, RegNum, Label, SEnv)
 
-emitL (EVar pos id) gV gF nextReg nextLab gS lTrue lFalse =
+emitL (EVar pos id) gV gF gI nextReg nextLab gS lTrue lFalse =
     (opCode (CondGoOp (gV ! id) lTrue lFalse), nextReg, nextLab, gS)
 
-emitL (ELitTrue pos) gV gF nextReg nextLab gS lTrue lFalse =
+emitL (ELitTrue pos) gV gF gI nextReg nextLab gS lTrue lFalse =
     (opCode (GoOp lTrue), nextReg, nextLab, gS)
 
-emitL (ELitFalse pos) gV gF nextReg nextLab gS lTrue lFalse =
+emitL (ELitFalse pos) gV gF gI nextReg nextLab gS lTrue lFalse =
     (opCode (GoOp lTrue), nextReg, nextLab, gS)
 
-emitL (EApp pos id exps) gV gF nextReg nextLab gS lTrue lFalse =
-    let (args, codes, nextReg', nextLab', gS') = emitArgs exps gV gF ([], noCode, nextReg, nextLab, gS) in
-        let dest = (gF ! id, nextReg') in
-            (codes
-            . opCode (CallOp dest id args)
-            . opCode (CondGoOp (Right dest) lTrue lFalse),
-            nextReg' + 1, nextLab', gS')
+emitL (EApp pos id exps) gV gF gI nextReg nextLab gS lTrue lFalse =
+    let (results, codes, nextReg', nextLab', gS') = emitArgs exps gV gF gI ([], noCode, nextReg, nextLab, gS) in
+        if Data.Map.member id gF then
+            let dest = (gF ! id, nextReg') in
+                (codes
+                . opCode (CallOp dest id results)
+                . opCode (CondGoOp (Right dest) lTrue lFalse),
+                nextReg' + 1, nextLab', gS')
+        else -------------------------------------------------------- APLIKACJA FUNKCJI INLINE
+            let (t, args, block) = gI ! id in
+                let gB = mapArgsInl args results Data.Map.empty in
+                    let (_, _, nextReg'', nextLab'', code'', gS'', _) = emitB block Data.Map.empty gF gI gB nextReg' nextLab' gS' (Just (Left (lTrue, lFalse))) [] in
+                            (codes
+                            . code''
+                            . opCode (GoOp lFalse),
+                            nextReg'', nextLab'', gS'')
 
-emitL (Not pos exp) gV gF nextReg nextLab gS lTrue lFalse = -- negacja binarna
-    emitL exp gV gF nextReg nextLab gS lFalse lTrue
+emitL (Not pos exp) gV gF gI nextReg nextLab gS lTrue lFalse = -- negacja binarna
+    emitL exp gV gF gI nextReg nextLab gS lFalse lTrue
 
-emitL (ERel pos exp1 op exp2) gV gF nextReg nextLab gS lTrue lFalse =
-    let (res1, code1, nextReg1, nextLab1, gS1) = emitE exp1 gV gF nextReg nextLab gS in
-        let (res2, code2, nextReg2, nextLab2, gS2) = emitE exp2 gV gF nextReg1 nextLab1 gS1 in
+emitL (ERel pos exp1 op exp2) gV gF gI nextReg nextLab gS lTrue lFalse =
+    let (res1, code1, nextReg1, nextLab1, gS1) = emitE exp1 gV gF gI nextReg nextLab gS in
+        let (res2, code2, nextReg2, nextLab2, gS2) = emitE exp2 gV gF gI nextReg1 nextLab1 gS1 in
             let dest = (RegBool, nextReg2) in
                 let condGoCode = opCode (CondGoOp (Right dest) lTrue lFalse) in
                     case op of
@@ -213,19 +267,19 @@ emitL (ERel pos exp1 op exp2) gV gF nextReg nextLab gS lTrue lFalse =
                         EQU _ -> (code1 . code2 . opCode (EQUOp dest res1 res2) . condGoCode, nextReg2 + 1, nextLab2, gS2)
                         NE _ -> (code1 . code2 . opCode (NEOp dest res1 res2) . condGoCode, nextReg2 + 1, nextLab2, gS2)
 
-emitL (EAnd pos exp1 exp2) gV gF nextReg nextLab gS lTrue lFalse =
+emitL (EAnd pos exp1 exp2) gV gF gI nextReg nextLab gS lTrue lFalse =
     -- lP = nextLab
-    let (code1, nextReg1, nextLab1, gS1) = emitL exp1 gV gF nextReg (nextLab + 1) gS nextLab lFalse in
-        let (code2, nextReg2, nextLab2, gS2) = emitL exp2 gV gF nextReg1 nextLab1 gS1 lTrue lFalse in
+    let (code1, nextReg1, nextLab1, gS1) = emitL exp1 gV gF gI nextReg (nextLab + 1) gS nextLab lFalse in
+        let (code2, nextReg2, nextLab2, gS2) = emitL exp2 gV gF gI nextReg1 nextLab1 gS1 lTrue lFalse in
             (code1
             . opCode (LabelOp nextLab)
             . code2,
             nextReg2, nextLab2, gS2)
 
-emitL (EOr pos exp1 exp2) gV gF nextReg nextLab gS lTrue lFalse =
+emitL (EOr pos exp1 exp2) gV gF gI nextReg nextLab gS lTrue lFalse =
     -- lP = nextLab
-    let (code1, nextReg1, nextLab1, gS1) = emitL exp1 gV gF nextReg (nextLab + 1) gS lTrue nextLab in
-        let (code2, nextReg2, nextLab2, gS2) = emitL exp2 gV gF nextReg1 nextLab1 gS1 lTrue lFalse in
+    let (code1, nextReg1, nextLab1, gS1) = emitL exp1 gV gF gI nextReg (nextLab + 1) gS lTrue nextLab in
+        let (code2, nextReg2, nextLab2, gS2) = emitL exp2 gV gF gI nextReg1 nextLab1 gS1 lTrue lFalse in
             (code1
             . opCode (LabelOp nextLab)
             . code2,
@@ -233,14 +287,14 @@ emitL (EOr pos exp1 exp2) gV gF nextReg nextLab gS lTrue lFalse =
 
 ---------------------------------------------------------------------------------
 
-emitB :: Block -> VEnv -> FEnv -> VEnv -> RegNum -> Label -> SEnv -> (VEnv, VEnv, RegNum, Label, Code, SEnv)
+emitB :: Block -> VEnv -> FEnv -> IEnv -> VEnv -> RegNum -> Label -> SEnv -> Maybe (Either (Label, Label) Label) -> [(Res, Label)] -> (VEnv, VEnv, RegNum, Label, Code, SEnv, [(Res, Label)])
 
-emitB block gV gF gB nextReg nextLab gS = case block of
+emitB block gV gF gI gB nextReg nextLab gS phiLab phiList = case block of
     Block pos (stmt : rest) ->
-        let (gV', gB', nextReg', nextLab', code', gS') = emitS stmt gV gF gB nextReg nextLab gS in
-            let (gV'', gB'', nextReg'', nextLab'', code'', gS'') = emitB (Block pos rest) gV' gF gB' nextReg' nextLab' gS' in
-                (gV'', gB'', nextReg'', nextLab'', code' . code'', gS'')
-    Block pos [] -> (gV, gB, nextReg, nextLab, noCode, gS)
+        let (gV', gB', nextReg', nextLab', code', gS', phiList') = emitS stmt gV gF gI gB nextReg nextLab gS phiLab phiList in
+            let (gV'', gB'', nextReg'', nextLab'', code'', gS'', phiList'') = emitB (Block pos rest) gV' gF gI gB' nextReg' nextLab' gS' phiLab phiList' in
+                (gV'', gB'', nextReg'', nextLab'', code' . code'', gS'', phiList'')
+    Block pos [] -> (gV, gB, nextReg, nextLab, noCode, gS, phiList)
 
 
 phi :: [(Ident, Res)] -> (Label, VEnv) -> (Label, VEnv) -> RegNum -> Code -> VEnv -> (RegNum, Code, VEnv)
@@ -254,67 +308,74 @@ phi vars (label1, gV1) (label2, gV2) nextReg code gV =
                 let dest = (resRegType res, nextReg) in
                     phi rest (label1, gV1) (label2, gV2) (nextReg + 1) (code . opCode (PhiOp dest [(gV1 ! id, label1), (gV2 ! id, label2)])) (Data.Map.insert id (Right dest) gV)
 
-emitS :: Stmt -> VEnv -> FEnv -> VEnv -> RegNum -> Label -> SEnv -> (VEnv, VEnv, RegNum, Label, Code, SEnv)
+emitS :: Stmt -> VEnv -> FEnv -> IEnv -> VEnv -> RegNum -> Label -> SEnv -> Maybe (Either (Label, Label) Label) -> [(Res, Label)] -> (VEnv, VEnv, RegNum, Label, Code, SEnv, [(Res, Label)])
 
-emitS (Empty _) gV gF gB nextReg nextLab gS = (gV, gB, nextReg, nextLab, noCode, gS)
+emitS (Empty _) gV gF gI gB nextReg nextLab gS phiLab phiList = (gV, gB, nextReg, nextLab, noCode, gS, phiList)
 
-emitS (BStmt _ block) gV gF gB nextReg nextLab gS =
-    let (gV', gB', nextReg', nextLab', code', gS') = emitB block (Data.Map.union gB gV) gF Data.Map.empty nextReg nextLab gS in
-        (Data.Map.union (Data.Map.difference gV' gB) gV, Data.Map.intersection gV' gB, nextReg', nextLab', code', gS')
+emitS (BStmt _ block) gV gF gI gB nextReg nextLab gS phiLab phiList =
+    let (gV', gB', nextReg', nextLab', code', gS', phiList') = emitB block (Data.Map.union gB gV) gF gI Data.Map.empty nextReg nextLab gS phiLab phiList in
+        (Data.Map.union (Data.Map.difference gV' gB) gV, Data.Map.intersection gV' gB, nextReg', nextLab', code', gS', phiList')
 
-emitS (Decl pos t items) gV gF gB nextReg nextLab gS =
+emitS (Decl pos t items) gV gF gI gB nextReg nextLab gS phiLab phiList =
     case (t, items) of
-        (_, []) -> (gV, gB, nextReg, nextLab, noCode, gS)
+        (_, []) -> (gV, gB, nextReg, nextLab, noCode, gS, phiList)
 
         (_, Init p id exp : rest) ->
-            let (res, code', nextReg', nextLab', gS') = emitE exp (Data.Map.union gB gV) gF nextReg nextLab gS in
-                let (gV'', gB'', nextReg'', nextLab'', code'', gS'') = emitS (Decl pos t rest) gV gF (Data.Map.insert id res gB) nextReg' nextLab' gS' in
-                    (gV'', gB'', nextReg'', nextLab'', code' . code'', gS'')
+            let (res, code', nextReg', nextLab', gS') = emitE exp (Data.Map.union gB gV) gF gI nextReg nextLab gS in
+                let (gV'', gB'', nextReg'', nextLab'', code'', gS'', phiList'') = emitS (Decl pos t rest) gV gF gI (Data.Map.insert id res gB) nextReg' nextLab' gS' phiLab phiList in
+                    (gV'', gB'', nextReg'', nextLab'', code' . code'', gS'', phiList'')
 
         (Str _, NoInit p id : rest) ->
             if Data.Map.member "" gS then
                 let code' = opCode (BitcastOp (RegStr, nextReg) 0 (gS ! "")) in
-                    let (gV'', gB'', nextReg'', nextLab'', code'', gS'') = emitS (Decl pos t rest) gV gF (Data.Map.insert id (Right (RegStr, nextReg)) gB) (nextReg + 1) nextLab gS in
-                        (gV'', gB'', nextReg'', nextLab'', code' . code'', gS'')
+                    let (gV'', gB'', nextReg'', nextLab'', code'', gS'', phiList'') = emitS (Decl pos t rest) gV gF gI (Data.Map.insert id (Right (RegStr, nextReg)) gB) (nextReg + 1) nextLab gS phiLab phiList in
+                        (gV'', gB'', nextReg'', nextLab'', code' . code'', gS'', phiList'')
             else
                 let idx = toInteger (Data.Map.size gS) in
                     let code' = opCode (BitcastOp (RegStr, nextReg) 0 idx) in
-                        let (gV'', gB'', nextReg'', nextLab'', code'', gS'') = emitS (Decl pos t rest) gV gF (Data.Map.insert id (Right (RegStr, nextReg)) gB) (nextReg + 1) nextLab (Data.Map.insert "" idx gS) in
-                            (gV'', gB'', nextReg'', nextLab'', code' . code'', gS'')
+                        let (gV'', gB'', nextReg'', nextLab'', code'', gS'', phiList'') = emitS (Decl pos t rest) gV gF gI (Data.Map.insert id (Right (RegStr, nextReg)) gB) (nextReg + 1) nextLab (Data.Map.insert "" idx gS) phiLab phiList in
+                            (gV'', gB'', nextReg'', nextLab'', code' . code'', gS'', phiList'')
 
         (_, NoInit p id : rest) ->
-            emitS (Decl pos t rest) gV gF (Data.Map.insert id (typeDefault t) gB) nextReg nextLab gS
+            emitS (Decl pos t rest) gV gF gI (Data.Map.insert id (typeDefault t) gB) nextReg nextLab gS phiLab phiList
 
 
-emitS (Ass pos id exp) gV gF gB nextReg nextLab gS =
-    let (res, code', nextReg', nextLab',gS') = emitE exp (Data.Map.union gB gV) gF nextReg nextLab gS in
-        if Data.Map.member id gB then (gV, Data.Map.insert id res gB, nextReg', nextLab', code', gS')
-        else (Data.Map.insert id res gV, gB, nextReg', nextLab', code', gS')
+emitS (Ass pos id exp) gV gF gI gB nextReg nextLab gS phiLab phiList =
+    let (res, code', nextReg', nextLab',gS') = emitE exp (Data.Map.union gB gV) gF gI nextReg nextLab gS in
+        if Data.Map.member id gB then (gV, Data.Map.insert id res gB, nextReg', nextLab', code', gS', phiList)
+        else (Data.Map.insert id res gV, gB, nextReg', nextLab', code', gS', phiList)
 
-emitS (Incr pos id) gV gF gB nextReg nextLab gS =
+emitS (Incr pos id) gV gF gI gB nextReg nextLab gS phiLab phiList =
     let dest = (RegInt, nextReg) in
         if Data.Map.member id gB then
-            (gV, Data.Map.insert id (Right dest) gB, nextReg + 1, nextLab, opCode (PlusOp dest (gB ! id) (Left (ConstInt 1))), gS)
+            (gV, Data.Map.insert id (Right dest) gB, nextReg + 1, nextLab, opCode (PlusOp dest (gB ! id) (Left (ConstInt 1))), gS, phiList)
         else
-            (Data.Map.insert id (Right dest) gV, gB, nextReg + 1, nextLab, opCode (PlusOp dest (gV ! id) (Left (ConstInt 1))), gS)
+            (Data.Map.insert id (Right dest) gV, gB, nextReg + 1, nextLab, opCode (PlusOp dest (gV ! id) (Left (ConstInt 1))), gS, phiList)
 
-emitS (Decr pos id) gV gF gB nextReg nextLab gS =
+emitS (Decr pos id) gV gF gI gB nextReg nextLab gS phiLab phiList =
     let dest = (RegInt, nextReg) in
         if Data.Map.member id gB then
-            (gV, Data.Map.insert id (Right dest) gB, nextReg + 1, nextLab, opCode (MinusOp dest (gB ! id) (Left (ConstInt 1))), gS)
+            (gV, Data.Map.insert id (Right dest) gB, nextReg + 1, nextLab, opCode (MinusOp dest (gB ! id) (Left (ConstInt 1))), gS, phiList)
         else
-            (Data.Map.insert id (Right dest) gV, gB, nextReg + 1, nextLab, opCode (MinusOp dest (gV ! id) (Left (ConstInt 1))), gS)
+            (Data.Map.insert id (Right dest) gV, gB, nextReg + 1, nextLab, opCode (MinusOp dest (gV ! id) (Left (ConstInt 1))), gS, phiList)
 
-emitS (Ret _ exp) gV gF gB nextReg nextLab gS =
-    let (res, code', nextReg', nextLab', gS') = emitE exp (Data.Map.union gB gV) gF nextReg nextLab gS in
-        (gV, gB, nextReg', nextLab' + 1, code' . opCode (RetOp res) . opCode (LabelOp nextLab'), gS')
+emitS (Ret _ exp) gV gF gI gB nextReg nextLab gS phiLab phiList =
+    let (res, code', nextReg', nextLab', gS') = emitE exp (Data.Map.union gB gV) gF gI nextReg nextLab gS in
+        case phiLab of
+            Nothing -> (gV, gB, nextReg', nextLab' + 1, code' . opCode (RetOp res) . opCode (LabelOp nextLab'), gS', phiList)
+            Just (Right label) -> (gV, gB, nextReg', nextLab' + 1, code' . opCode (GoOp label) . opCode (LabelOp nextLab'), gS', ((res, nextLab' - 1) : phiList))
+            Just (Left (lTrue, lFalse)) -> (gV, gB, nextReg', nextLab' + 1, code' . opCode (CondGoOp res lTrue lFalse) . opCode (LabelOp nextLab'), gS', phiList)
         -- (gV, gB, nextReg', nextLab, code' . opCode (RetOp res), gS')
 
-emitS (VRet pos) gV gF gB nextReg nextLab gS = (gV, gB, nextReg, nextLab + 1, opCode (RetOp (Left ConstVoid)) . opCode (LabelOp nextLab), gS)
+emitS (VRet pos) gV gF gI gB nextReg nextLab gS phiLab phiList =
+    case phiLab of
+        Nothing -> (gV, gB, nextReg, nextLab + 1, opCode (RetOp (Left ConstVoid)) . opCode (LabelOp nextLab), gS, phiList)
+        Just (Right label) -> (gV, gB, nextReg, nextLab + 1, opCode (GoOp label) . opCode (LabelOp nextLab), gS, phiList)
+        -- Just (Left (lTrue, lFalse)) -> nie powinno się stać
 
-emitS (Cond _ exp stmt) gV gF gB nextReg nextLab gS =
-    let (resExp, codeExp, nextRegExp, nextLabExp, gSExp) = emitE exp (Data.Map.union gB gV) gF nextReg (nextLab + 1) gS in
-        let (gVStmt, gBStmt, nextRegStmt, nextLabStmt, codeStmt, gSStmt) = emitS stmt gV gF gB nextRegExp nextLabExp gSExp in
+emitS (Cond _ exp stmt) gV gF gI gB nextReg nextLab gS phiLab phiList =
+    let (resExp, codeExp, nextRegExp, nextLabExp, gSExp) = emitE exp (Data.Map.union gB gV) gF gI nextReg (nextLab + 1) gS in
+        let (gVStmt, gBStmt, nextRegStmt, nextLabStmt, codeStmt, gSStmt, phiListStmt) = emitS stmt gV gF gI gB nextRegExp nextLabExp gSExp phiLab phiList in
             let (nextRegPhiV, codePhiV, gVPhi) = phi (Data.Map.toList gV) (nextLab - 1, gV) (nextLabStmt - 1, gVStmt) nextRegStmt noCode Data.Map.empty in
                 let (nextRegPhiB, codePhiB, gBPhi) = phi (Data.Map.toList gB) (nextLab - 1, gB) (nextLabStmt - 1, gBStmt) nextRegPhiV noCode Data.Map.empty in
 
@@ -328,12 +389,12 @@ emitS (Cond _ exp stmt) gV gF gB nextReg nextLab gS =
 
                     . opCode (LabelOp nextLabStmt)                  -- LFalse
                     . codePhiV . codePhiB,
-                    gSStmt)
+                    gSStmt, phiListStmt)
 
-emitS (CondElse pos exp stmt1 stmt2) gV gF gB nextReg nextLab gS =
-    let (res, code', nextReg', nextLab', gS') = emitE exp (Data.Map.union gB gV) gF nextReg (nextLab + 1) gS in
-        let (gV1, gB1, nextReg1, nextLab1, code1, gS1) = emitS stmt1 gV gF gB nextReg' nextLab' gS' in
-            let (gV2, gB2, nextReg2, nextLab2, code2, gS2) = emitS stmt2 gV gF gB nextReg1 (nextLab1 + 1) gS1 in
+emitS (CondElse pos exp stmt1 stmt2) gV gF gI gB nextReg nextLab gS phiLab phiList =
+    let (res, code', nextReg', nextLab', gS') = emitE exp (Data.Map.union gB gV) gF gI nextReg (nextLab + 1) gS in
+        let (gV1, gB1, nextReg1, nextLab1, code1, gS1, phiList1) = emitS stmt1 gV gF gI gB nextReg' nextLab' gS' phiLab phiList in
+            let (gV2, gB2, nextReg2, nextLab2, code2, gS2, phiList2) = emitS stmt2 gV gF gI gB nextReg1 (nextLab1 + 1) gS1 phiLab phiList1 in
 
                 let (nextRegPhiV, codePhiV, gVPhi) = phi (Data.Map.toList gV) (nextLab1 - 1, gV1) (nextLab2 - 1, gV2) nextReg2 noCode Data.Map.empty in
                     let (nextRegPhiB, codePhiB, gBPhi) = phi (Data.Map.toList gB) (nextLab1 - 1, gB1) (nextLab2 - 1, gB2) nextRegPhiV noCode Data.Map.empty in
@@ -352,20 +413,17 @@ emitS (CondElse pos exp stmt1 stmt2) gV gF gB nextReg nextLab gS =
 
                         . opCode (LabelOp nextLab2)                 -- LEnd:
                         . codePhiV . codePhiB,
-                        gS2)
+                        gS2, phiList2)
 
-emitS (While _ exp stmt) gV gF gB nextReg nextLab gS =
-            -- let (gVStmt, gBStmt, nextRegStmt, nextLabStmt, codeStmt, gSStmt) = emitS stmt gV gF gB nextReg (nextLab + 1) gS in
-            --     let (resExp, codeExp, nextRegExp, nextLabExp, gSExp) = emitE exp (Data.Map.union gB gV) gF nextRegStmt (nextLabStmt + 1) gSStmt in
-
-            let (resExp, codeExp, nextRegExp, nextLabExp, gSExp) = emitE exp (Data.Map.union gB gV) gF nextReg (nextLab + 1) gS in
-                let (gVStmt, gBStmt, nextRegStmt, nextLabStmt, codeStmt, gSStmt) = emitS stmt gV gF gB nextRegExp (nextLabExp + 1) gSExp in
+emitS (While _ exp stmt) gV gF gI gB nextReg nextLab gS phiLab phiList =
+            let (resExp, codeExp, nextRegExp, nextLabExp, gSExp) = emitE exp (Data.Map.union gB gV) gF gI nextReg (nextLab + 1) gS in
+                let (gVStmt, gBStmt, nextRegStmt, nextLabStmt, codeStmt, gSStmt, phiListStmt) = emitS stmt gV gF gI gB nextRegExp (nextLabExp + 1) gSExp phiLab phiList in
 
             let (nextRegPhiV, codePhiV, gVPhi) = phi (Data.Map.toList gV) (nextLab - 1, gV) (nextLabStmt - 1, gVStmt) nextRegStmt noCode Data.Map.empty in
                 let (nextRegPhiB, codePhiB, gBPhi) = phi (Data.Map.toList gB) (nextLab - 1, gB) (nextLabStmt - 1, gBStmt) nextRegPhiV noCode Data.Map.empty in
 
-            let (resExp', codeExp', nextRegExp', _, _) = emitE exp (Data.Map.union gBPhi gVPhi) gF nextReg (nextLab + 1) gS in
-                let (gVStmt', gBStmt', nextRegStmt', nextLabStmt', codeStmt', _) = emitS stmt gVPhi gF gBPhi nextRegExp (nextLabExp + 1) gSExp in
+            let (resExp', codeExp', nextRegExp', _, _) = emitE exp (Data.Map.union gBPhi gVPhi) gF gI nextReg (nextLab + 1) gS in
+                let (gVStmt', gBStmt', nextRegStmt', nextLabStmt', codeStmt', _, phiListStmt') = emitS stmt gVPhi gF gI gBPhi nextRegExp (nextLabExp + 1) gSExp phiLab phiList in
 
             (gVPhi, gBPhi, nextRegPhiB, nextLabStmt + 1,
             opCode (GoOp nextLab)                               -- goto L2
@@ -381,19 +439,21 @@ emitS (While _ exp stmt) gV gF gB nextReg nextLab gS =
             . opCode (GoOp nextLab)                             -- goto L2 (potrzebne tylko dla LLVM)
 
             . opCode (LabelOp nextLabStmt),                     -- LEnd (potrzebne tylko dla LLVM)
-            gSExp)
+            gSExp, phiListStmt')
 
-emitS (SExp _ exp) gV gF gB nextReg nextLab gS =
-    let (res, code', nextReg', nextLab', gS') = emitE exp (Data.Map.union gB gV) gF nextReg nextLab gS in
-        (gV, gB, nextReg', nextLab', code', gS')
+emitS (SExp _ exp) gV gF gI gB nextReg nextLab gS phiLab phiList =
+    let (res, code', nextReg', nextLab', gS') = emitE exp (Data.Map.union gB gV) gF gI nextReg nextLab gS in
+        (gV, gB, nextReg', nextLab', code', gS', phiList)
 
 ---------------------------------------------------------------------------------
 
-storeDFS :: [TopDef] -> FEnv -> FEnv
-storeDFS defs gF = case defs of
-    [] -> gF
+storeDFS :: [TopDef] -> FEnv -> IEnv -> (FEnv, IEnv)
+storeDFS defs gF gI = case defs of
+    [] -> (gF, gI)
     (FnDef pos t id args block : rest) ->
-        storeDFS rest (Data.Map.insert id (typeRegType t) gF)
+        storeDFS rest (Data.Map.insert id (typeRegType t) gF) gI
+    (InlFnDef pos t id args block : rest) ->
+        storeDFS rest gF (Data.Map.insert id (t, args, block) gI)
 
 mapArgs :: [Arg] -> VEnv -> RegNum -> [Reg] -> (VEnv, RegNum, [Reg])
 mapArgs args gV nextReg argList = case args of
@@ -402,10 +462,17 @@ mapArgs args gV nextReg argList = case args of
         let dest = (typeRegType t, nextReg) in
             mapArgs rest (Data.Map.insert id (Right dest) gV) (nextReg + 1) (dest : argList)
 
-emitDF :: TopDef -> FEnv -> Label -> SEnv -> (Label, Code, SEnv)
-emitDF (FnDef pos t id args block) gF nextLab gS =
+mapArgsInl :: [Arg] -> [Res] -> VEnv -> VEnv
+mapArgsInl args results gV =
+    case (args, results) of
+        ([], _) -> gV
+        ((Arg pos t id) : restArgs, res : restRes) ->
+            mapArgsInl restArgs restRes (Data.Map.insert id res gV)
+
+emitDF :: TopDef -> FEnv -> IEnv -> Label -> SEnv -> (Label, Code, SEnv)
+emitDF (FnDef pos t id args block) gF gI nextLab gS =
     let (gB, nextReg, argList) = mapArgs args Data.Map.empty 0 [] in
-        let (gV', gB', nextReg', nextLab', code', gS') = emitB block Data.Map.empty gF gB nextReg (nextLab + 1) gS in
+        let (gV', gB', nextReg', nextLab', code', gS', _) = emitB block Data.Map.empty gF gI gB nextReg (nextLab + 1) gS Nothing [] in
             case t of
                 Str _ -> let dest = (RegStr, nextReg') in
                     if Data.Map.member "" gS' then
@@ -436,12 +503,16 @@ emitDF (FnDef pos t id args block) gF nextLab gS =
                     . opCode EndFunOp,
                     gS')
 
-emitDFS :: [TopDef] -> FEnv -> Label -> SEnv -> (Code, SEnv)
-emitDFS defs gF nextLab gS = case defs of
+emitDF (InlFnDef pos t id args block) gF gI nextLab gS = (nextLab, noCode, gS)
+    -- let (nextLab', code', gS') = emitDF (FnDef pos t id args block) gF gI nextLab gS in
+    --     (nextLab, noCode, gS') -- spamiętuję napisy, ale nie generuję kodu
+
+emitDFS :: [TopDef] -> FEnv -> IEnv -> Label -> SEnv -> (Code, SEnv)
+emitDFS defs gF gI nextLab gS = case defs of
     [] -> (noCode, gS)
     (def : rest) ->
-        let (nextLab', code', gS') = emitDF def gF nextLab gS in
-            let (code'', gS'') = emitDFS rest gF nextLab' gS' in
+        let (nextLab', code', gS') = emitDF def gF gI nextLab gS in
+            let (code'', gS'') = emitDFS rest gF gI nextLab' gS' in
                 (code' . code'', gS'')
 
 ---------------------------------------------------------------------------------
@@ -499,6 +570,16 @@ reachable stack descs reach =
                         reachable stack' descs reach'
                 Nothing -> reachable rest descs reach
 
+predReach :: Set Label -> (Res, Label) -> Bool
+predReach reach (res, label) = Data.Set.member label reach
+
+removePhi :: Set Label -> [Op] -> [Op] -> [Op]
+removePhi reach ops acc =
+    case ops of
+        [] -> reverse acc
+        (PhiOp reg pairs : rest) -> removePhi reach rest (PhiOp reg (Prelude.filter (predReach reach) pairs) : acc)
+        (op : rest) -> removePhi reach rest (op : acc)
+
 remove :: [[Op]] -> Set Label -> [[Op]] -> [[Op]]
 remove blocks reach acc =
     case blocks of
@@ -506,7 +587,7 @@ remove blocks reach acc =
         ([FunOp id regType regs] : rest) -> remove rest reach ([FunOp id regType regs] : acc)
         ([EndFunOp] : rest) -> remove rest reach ([EndFunOp] : acc)
         ((LabelOp label : restBlock) : rest) ->
-            if Data.Set.member label reach then remove rest reach ((LabelOp label : restBlock) : acc)
+            if Data.Set.member label reach then remove rest reach ((removePhi reach (LabelOp label : restBlock) []) : acc)
             else remove rest reach acc
 
 removeUnreachable :: ([[Op]], Descs) -> [[Op]]
@@ -707,8 +788,8 @@ optimize ops =
 
 emitP :: Program -> ([Op], SEnv)
 emitP (Program _ defs) =
-    let gF = storeDFS defs initFEnv in
-        let (code, gS) = emitDFS defs gF 1 Data.Map.empty in
+    let (gF, gI) = storeDFS defs initFEnv initIEnv in
+        let (code, gS) = emitDFS defs gF gI 1 Data.Map.empty in
             (optimize (code []), gS)
 
 initFEnv :: FEnv
@@ -720,3 +801,5 @@ initFEnv = Data.Map.fromList [
     (Ident "readString", RegStr)
     ]
 
+initIEnv :: IEnv
+initIEnv = Data.Map.empty
