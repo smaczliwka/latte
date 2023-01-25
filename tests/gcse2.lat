@@ -1,0 +1,14 @@
+int main() {
+    int x = readInt();
+    int y = readInt();
+    int n = 5 * x, m = y - 7;
+    if (x > 0) {
+        printInt(y - 7 + 5 * x - 1);
+    }
+    else {
+        printInt(m);
+    }
+    printInt(n);
+    printInt(m);
+    return y - 7 + 5 * x - 1;
+}

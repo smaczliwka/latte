@@ -1,0 +1,23 @@
+int main() {
+    int x = readInt();
+    return f(x) + g(x);
+}
+
+inline int f(int a) {
+    printString("f");
+    return a + 1;
+}
+
+inline int g(int b) {
+    printString("b");
+    h();
+    return b - 1;
+}
+
+int h() {
+    int x = readInt();
+    if (x > 0) {
+        return h();
+    }
+    return 42;
+}

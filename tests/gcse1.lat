@@ -1,0 +1,13 @@
+int main() {
+    int x = readInt();
+    int y, z, n = x + 1;
+    if (x > 0) {
+        y = x + 1;
+        printInt(y);
+    }
+    else {
+        z = x + 1;
+        printInt(z);
+    }
+    return x + 1 + n;
+}

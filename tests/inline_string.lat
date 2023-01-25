@@ -1,0 +1,17 @@
+int main() {
+    printString(g(readInt()));
+    return 0;
+}
+
+inline string f() {
+    return "alamakota";
+}
+
+inline string g(int x) {
+    if (x > 0) {
+        return "wiekszy";
+    }
+    else {
+        return "mniejszy";
+    }
+}

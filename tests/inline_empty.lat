@@ -1,0 +1,6 @@
+int main() {
+    f();
+    return 0;
+}
+inline void f() {
+}

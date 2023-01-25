@@ -12,6 +12,7 @@ import ParLatte             (pProgram, myLexer)
 import Typechecker          (typecheck)
 import Emiter               (emitP)
 import Printer              (printLLVM)
+import Optimizer            (optimize)
 
 type Err        = Either String
 type ParseFun a = [Token] -> Err a
@@ -54,7 +55,9 @@ run parseFun s = case parseFun ts of
   ts = myLexer s
 
 compile :: Program -> String
-compile prog = printLLVM (emitP prog)
+compile prog =
+  let (ops, gS) = emitP prog in
+    printLLVM (optimize ops, gS)
 
 usage :: IO ()
 usage = do

@@ -1,0 +1,8 @@
+int main() {
+    printInt(neg(readInt()));
+    return 0;
+}
+
+inline int neg(int x) {
+    return -x;
+}

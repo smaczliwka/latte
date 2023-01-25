@@ -1,0 +1,15 @@
+int main() {
+    int x = readInt();
+    int y = g();
+    return x + f(y);
+}
+
+inline int f(int x) {
+    string s = "dupa";
+    return x + 1;
+}
+
+int g() {
+    string p = "blada";
+    return 7;
+}

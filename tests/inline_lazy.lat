@@ -1,0 +1,17 @@
+int main()
+{
+   printInt(f(1,-1));
+   return 0;
+}
+
+inline boolean greater(int a, int b) {
+    return (a > 0) && (b > 0);
+}
+
+inline boolean smaller (int a, int b) {
+    return (a < 0) && (b < 0);
+}
+
+int f(int a, int b) {
+  if(greater(a, b) || smaller(a, b)) {return 7;} else {return 42;}
+}  

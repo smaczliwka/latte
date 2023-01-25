@@ -1,0 +1,9 @@
+int main() {
+    printInt(bzw(readInt()));
+    return 0;
+}
+
+inline int bzw(int x) {
+    if (x > 0) return x;
+    return -x;
+}

@@ -1,16 +1,8 @@
-module Printer(printLLVM) where
+module Printer where
 
 import Emiter
-    ( SEnv,
-      Op(..),
-      Label,
-      Res,
-      Const(..),
-      Reg,
-      RegType(..),
-      resRegType )
-import AbsLatte ( Ident(Ident) )
-import Data.Map ( toList )
+import AbsLatte
+import Data.Map
 
 instance Show RegType where
     show t = case t of
@@ -139,4 +131,3 @@ printLLVM :: ([Op], SEnv) -> String
 printLLVM (ops, gS) =
     let prologue = Prelude.foldl showsStrLLVM declarations (toList gS) in
         Prelude.foldl showsOp prologue ops ""
-
